@@ -53,7 +53,7 @@
   .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:18px}
   h2{font-size:17px;font-weight:600;margin:0 0 6px}
   .note{font-size:13.5px;color:var(--muted);margin:0 0 16px;line-height:1.55}
-  .row{display:flex;gap:10px}
+  .row{display:flex;gap:10px;flex-wrap:wrap}
   label{display:block;font-size:13px;font-weight:600;color:var(--ink-soft);margin:0 0 6px}
   input{
     width:100%;padding:14px;font-size:17px;font-family:var(--mono);
@@ -70,13 +70,26 @@
   button:focus-visible{outline:3px solid var(--ink);outline-offset:2px}
   button:disabled{opacity:.45;cursor:not-allowed}
 
-  .btn-punch{
-    min-height:88px;padding:16px;background:var(--ink);color:#fff;
-    display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;
+  .section-label{font-size:13px;font-weight:600;color:var(--ink-soft);margin:0 0 8px}
+
+  /* ── 選択式ボタン（押すと選択状態になるだけで送信はしない） ── */
+  .btn-toggle{
+    min-height:64px;padding:12px;background:#fff;color:var(--ink-soft);
+    border:1px solid var(--line);
+    display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;
   }
-  .btn-punch .sub{font-size:12.5px;font-weight:400;color:#9FB1BE;font-family:var(--mono)}
-  .btn-punch.ghost{background:#fff;color:var(--ink-soft);border-color:var(--line);min-height:64px}
-  .btn-punch.ghost .sub{color:var(--muted)}
+  .btn-toggle .sub{font-size:11.5px;font-weight:400;color:var(--muted);font-family:var(--mono)}
+  .btn-toggle.selected{background:var(--ink);color:#fff;border-color:var(--ink)}
+  .btn-toggle.selected .sub{color:#9FB1BE}
+
+  .btn-punch{flex:1 1 0;min-height:76px}
+
+  .cat-row{margin-bottom:6px}
+  .btn-cat{flex:1 1 auto;min-width:0;min-height:48px;padding:10px;font-size:14.5px;font-weight:500}
+
+  .btn-submit{min-height:56px;background:var(--ink);color:#fff;margin-top:4px}
+  .btn-submit:disabled{opacity:.35}
+
   .btn-sm{min-height:48px;padding:12px;background:#fff;border-color:var(--line);color:var(--ink-soft);font-size:14.5px;font-weight:500}
   .btn-primary{min-height:54px;background:var(--ink);color:#fff}
   .btn-text{min-height:44px;background:none;border:none;color:var(--muted);font-size:14px;font-weight:500;text-decoration:underline}
@@ -171,14 +184,18 @@
     <p class="who" id="who">&nbsp;</p>
     <div class="geo pending" id="geo"><span class="dot"></span><span id="geo-text">位置情報を取得しています…</span></div>
     <div id="punch-msg"></div>
-    <div class="row" style="margin-bottom:10px">
-      <button class="btn-punch" id="btn-in">出勤<span class="sub" id="sub-in">CLOCK IN</span></button>
-      <button class="btn-punch" id="btn-out">退勤<span class="sub" id="sub-out">CLOCK OUT</span></button>
+
+    <p class="section-label">カテゴリー</p>
+    <div class="row cat-row" id="cat-row"></div>
+
+    <p class="section-label">打刻</p>
+    <div class="row" style="margin-bottom:14px">
+      <button class="btn-toggle btn-punch" id="btn-in">出勤<span class="sub" id="sub-in">CLOCK IN</span></button>
+      <button class="btn-toggle btn-punch" id="btn-out">早退<span class="sub" id="sub-out">EARLY LEAVE</span></button>
     </div>
-    <div class="row">
-      <button class="btn-sm" id="btn-bs">休憩開始</button>
-      <button class="btn-sm" id="btn-be">休憩終了</button>
-    </div>
+
+    <button class="btn-submit" id="btn-submit" disabled>送信する</button>
+
     <div class="spacer"></div>
     <button class="btn-text" id="btn-reset">別の人として登録し直す</button>
   </section>
@@ -220,7 +237,7 @@ const QUEUE_KEY = 'punch.queue';
 
 /* ── 小道具 ─────────────────────────── */
 const $ = id => document.getElementById(id);
-const TYPE_LABEL = { IN:'出勤', OUT:'退勤', BREAK_START:'休憩開始', BREAK_END:'休憩終了' };
+const TYPE_LABEL = { IN:'出勤', OUT:'早退' };
 
 function show(name){
   ['boot','register','punch','done','error'].forEach(s =>
@@ -297,7 +314,10 @@ function paintGeo(geo){
 }
 
 /* ── 状態 ────────────────────────────── */
-const state = { loc:null, token:null, geo:{ status:'PENDING' }, sending:false };
+const state = {
+  loc:null, token:null, geo:{ status:'PENDING' }, sending:false,
+  categories:[], selectedCategory:null, selectedType:null
+};
 
 /* ── 起動 ────────────────────────────── */
 async function boot(){
@@ -320,11 +340,53 @@ async function boot(){
   await openPunch();
 }
 
+/* ── カテゴリー・打刻種別の選択 UI ──────
+   ボタンは押しても送信されず、選択状態になるだけ。
+   実際の送信は btn-submit を押したときに行う。 */
+function renderCategories(){
+  const row = $('cat-row');
+  row.innerHTML = '';
+  state.categories.forEach(c => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'btn-toggle btn-cat';
+    b.textContent = c.label;
+    b.dataset.id = c.id;
+    b.onclick = () => selectCategory(c.id);
+    row.appendChild(b);
+  });
+  paintCategorySelection();
+}
+function paintCategorySelection(){
+  $('cat-row').querySelectorAll('.btn-cat').forEach(b =>
+    b.classList.toggle('selected', b.dataset.id === state.selectedCategory));
+}
+function selectCategory(id){
+  state.selectedCategory = id;
+  paintCategorySelection();
+  updateSubmitEnabled();
+}
+function selectType(type){
+  state.selectedType = type;
+  $('btn-in').classList.toggle('selected', type === 'IN');
+  $('btn-out').classList.toggle('selected', type === 'OUT');
+  updateSubmitEnabled();
+}
+function updateSubmitEnabled(){
+  $('btn-submit').disabled = !(state.selectedCategory && state.selectedType) || state.sending;
+}
+
 async function openPunch(){
   show('punch');
   setMsg($('punch-msg'), '');
   $('geo').className = 'geo pending';
   $('geo-text').textContent = '位置情報を取得しています…';
+
+  state.selectedCategory = null;
+  state.selectedType = null;
+  $('btn-in').classList.remove('selected');
+  $('btn-out').classList.remove('selected');
+  updateSubmitEnabled();
 
   getPosition().then(g => { state.geo = g; paintGeo(g); });   // 並行で取得
 
@@ -361,19 +423,21 @@ async function openPunch(){
   }
   $('who').textContent = r.name + (r.last ? ` ／ 前回 ${r.last.type_label} ${r.last.at_label}` : ' ／ 本日まだ打刻がありません');
 
-  // 次に押すべきボタンを目立たせる（自動確定はしない）
-  const suggest = r.suggest || 'IN';
-  $('btn-in').classList.toggle('ghost', suggest !== 'IN');
-  $('btn-out').classList.toggle('ghost', suggest !== 'OUT');
-  $('sub-in').textContent  = suggest === 'IN'  ? 'おすすめ' : 'CLOCK IN';
-  $('sub-out').textContent = suggest === 'OUT' ? 'おすすめ' : 'CLOCK OUT';
+  state.categories = r.categories || [];
+  renderCategories();
+
+  // 次に押すべきボタンをあらかじめ選択状態にしておく（送信はされない。変更も可能）
+  selectType(r.suggest || 'IN');
 }
 
 /* ── 打刻送信 ───────────────────────── */
-async function punch(type){
-  if (state.sending) return;
+async function submitPunch(){
+  if (state.sending || !state.selectedType || !state.selectedCategory) return;
+  const type = state.selectedType;
+  const category = state.selectedCategory;
+
   state.sending = true;
-  ['btn-in','btn-out','btn-bs','btn-be'].forEach(id => $(id).disabled = true);
+  $('btn-submit').disabled = true;
   setMsg($('punch-msg'), '');
 
   const job = {
@@ -381,6 +445,7 @@ async function punch(type){
     token: state.token,
     l: state.loc,
     type: type,
+    category: category,
     geo: state.geo.status === 'PENDING' ? { status:'TIMEOUT' } : state.geo,
     client_uuid: uuid(),
     client_time: new Date().toISOString(),
@@ -395,12 +460,15 @@ async function punch(type){
     return done({ ok:true, queued:true, type:type }, job);
   } finally {
     state.sending = false;
-    ['btn-in','btn-out','btn-bs','btn-be'].forEach(id => $(id).disabled = false);
+    updateSubmitEnabled();
   }
 
   if (!r.ok){
     if (r.error === 'TOO_SOON'){
       return setMsg($('punch-msg'), '直前に同じ打刻があります。二重打刻は記録されていません。', 'warn');
+    }
+    if (r.error === 'BAD_CATEGORY'){
+      return setMsg($('punch-msg'), 'カテゴリーを選択してください。', 'warn');
     }
     if (r.error === 'AUTH'){
       store(TOKEN_KEY, null);
@@ -424,7 +492,10 @@ function done(r, job){
   stamp.textContent = TYPE_LABEL[job.type] || '記録';
   stamp.className = 'stamp ' + (job.type === 'IN' ? 'in' : 'out');
 
+  const catLabel = (state.categories.find(c => c.id === job.category) || {}).label;
+
   const rows = [['場所', r.loc_name || $('locName').textContent]];
+  if (r.category_label || catLabel) rows.push(['カテゴリー', r.category_label || catLabel]);
   if (job.geo.status === 'OK'){
     rows.push(['位置', `±${job.geo.accuracy}m`]);
     if (r.distance !== undefined && r.distance !== '') rows.push(['登録地点から', `${r.distance}m`]);
@@ -432,6 +503,8 @@ function done(r, job){
   } else {
     rows.push(['位置', '記録なし']);
   }
+  if (r.day_worked_hours !== undefined && r.day_worked_hours !== '') rows.push(['本日の実働', `${r.day_worked_hours}h`]);
+  if (r.scheduled_hours !== undefined && r.scheduled_hours !== '') rows.push(['所定時間', `${r.scheduled_hours}h`]);
   $('d-meta').innerHTML = rows.map(([k,v]) =>
     `<div><dt>${k}</dt><dd>${v}</dd></div>`).join('');
 
@@ -497,10 +570,9 @@ function fail(title, body){
 }
 
 /* ── 配線 ────────────────────────────── */
-$('btn-in').onclick  = () => punch('IN');
-$('btn-out').onclick = () => punch('OUT');
-$('btn-bs').onclick  = () => punch('BREAK_START');
-$('btn-be').onclick  = () => punch('BREAK_END');
+$('btn-in').onclick  = () => selectType('IN');
+$('btn-out').onclick = () => selectType('OUT');
+$('btn-submit').onclick = submitPunch;
 $('btn-again').onclick = () => openPunch();
 $('btn-retry').onclick = () => location.reload();
 $('btn-register').onclick = register;

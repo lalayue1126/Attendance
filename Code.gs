@@ -11,6 +11,8 @@
  *        実行するユーザー   : 自分
  *        アクセスできるユーザー: 全員
  *   4. 発行された /exec URL を index.html の CONFIG.API_URL に貼る
+ *   5. schedules シートに日付ごとの所定時間（開始時刻・所定時間数）を手入力する
+ *   6. categories シートでカテゴリー（label）を実際の運用に合わせて編集する
  * ══════════════════════════════════════════════════════════════
  */
 
@@ -29,7 +31,12 @@ const CONFIG = {
   DEFAULT_RADIUS_M: 100,
 
   // 逆ジオコーディング（PORTABLE のみ）。不要なら false
-  REVERSE_GEOCODE: true
+  REVERSE_GEOCODE: true,
+
+  // schedules シートにその日の行が無いときだけ使う既定の所定時間
+  // （本来は日付ごとに schedules シートへ手入力する運用のための保険）
+  DEFAULT_SCHEDULED_START: '09:00',
+  DEFAULT_SCHEDULED_HOURS: 8
 };
 
 const SHEETS = {
@@ -37,11 +44,13 @@ const SHEETS = {
   DEVICES: 'devices',
   LOCATIONS: 'locations',
   EVENTS: 'punch_events',
-  CORRECTIONS: 'corrections'
+  CORRECTIONS: 'corrections',
+  SCHEDULES: 'schedules',
+  CATEGORIES: 'categories'
 };
 
 const TYPE_LABEL = {
-  IN: '出勤', OUT: '退勤', BREAK_START: '休憩開始', BREAK_END: '休憩終了'
+  IN: '出勤', OUT: '早退'
 };
 
 
@@ -142,6 +151,7 @@ function handleState(req) {
     loc_name: site.name,
     loc_type: site.type,
     suggest: suggestNext(last),
+    categories: listActiveCategories(),
     last: last ? {
       type: last.punch_type,
       type_label: TYPE_LABEL[last.punch_type] || last.punch_type,
@@ -187,6 +197,11 @@ function handlePunch(req) {
       return { ok: false, error: 'BAD_TYPE', message: '打刻の種別が不正です。' };
     }
 
+    const category = findCategory(req.category);
+    if (!category) {
+      return { ok: false, error: 'BAD_CATEGORY', message: 'カテゴリーを選択してください。' };
+    }
+
     // ── 冪等性チェック : オフライン再送で二重に入らないようにする
     const uuidKey = 'uuid:' + req.client_uuid;
     const cache = CacheService.getScriptCache();
@@ -225,8 +240,18 @@ function handlePunch(req) {
       }
     }
 
-    // ── 追記 : 時刻はサーバー側を正とする
+    // ── 実働時間の算出
+    // 出勤のみ（早退なし）なら所定時間まるごと働いたものとして扱い、
+    // 出勤が遅れた／早退した分だけ所定時間から差し引く。
+    // 1日に複数回の出勤・早退（分割シフト）にも対応する。
     const now = new Date();
+    const bDate = businessDate(now);
+    const todaySoFar = getTodayEvents(emp.employee_code, bDate);
+    const schedule = findSchedule(bDate, emp.employee_code);
+    const workedHours = computeDayWorkedHours(
+      schedule, bDate, todaySoFar.concat([{ type: type, punched_at: now }]));
+
+    // ── 追記 : 時刻はサーバー側を正とする
     sheet(SHEETS.EVENTS).appendRow([
       Utilities.getUuid(),
       emp.employee_code,
@@ -235,7 +260,8 @@ function handlePunch(req) {
       site.name,
       now,
       type,
-      businessDate(now),
+      category.category_id,
+      bDate,
       isNum(geo.lat) ? geo.lat : '',
       isNum(geo.lng) ? geo.lng : '',
       isNum(geo.accuracy) ? Math.round(Number(geo.accuracy)) : '',
@@ -245,7 +271,8 @@ function handlePunch(req) {
       req.client_uuid || '',
       req.client_time || '',
       String(req.ua || '').slice(0, 60),
-      false
+      false,
+      workedHours
     ]);
 
     if (req.client_uuid) cache.put(uuidKey, '1', 21600); // 6時間
@@ -257,7 +284,10 @@ function handlePunch(req) {
       loc_name: site.name,
       geo_status: geoStatus,
       distance: distance,
-      address: address
+      address: address,
+      category_label: category.label,
+      day_worked_hours: workedHours,
+      scheduled_hours: schedule ? Number(schedule.scheduled_hours) : ''
     };
 
   } finally {
@@ -304,31 +334,118 @@ function findLocation(locId) {
   return null;
 }
 
+function findCategory(id) {
+  if (!id) return null;
+  const t = readTable(SHEETS.CATEGORIES);
+  const key = String(id).trim();
+  for (const c of t.rows) {
+    if (String(c.category_id).trim() === key && truthy(c.is_active)) return c;
+  }
+  return null;
+}
+
+function listActiveCategories() {
+  const t = readTable(SHEETS.CATEGORIES);
+  return t.rows
+    .filter(c => truthy(c.is_active))
+    .sort((a, b) => (Number(a.sort_order) || 0) - (Number(b.sort_order) || 0))
+    .map(c => ({ id: String(c.category_id), label: String(c.label) }));
+}
+
 /**
- * 本人の当日分の最終打刻を返す。
- * 末尾から遡るので、行数が増えても速度は落ちない。
+ * その日・その社員の所定時間を探す。
+ * 個人別の行を優先し、無ければ employee_code が空の「全員共通」行を使う。
+ * どちらも無い場合は CONFIG の既定値で計算を続行する（保険）。
  */
-function getLastPunchToday(code) {
+function findSchedule(businessDateStr, employeeCode) {
+  const t = readTable(SHEETS.SCHEDULES);
+  let fallback = null;
+  for (const r of t.rows) {
+    if (normalizeDateStr(r.business_date) !== businessDateStr) continue;
+    const code = String(r.employee_code || '').trim().toUpperCase();
+    if (code === String(employeeCode).trim().toUpperCase()) return r;
+    if (!code) fallback = r;
+  }
+  if (fallback) return fallback;
+  return {
+    business_date: businessDateStr,
+    employee_code: '',
+    scheduled_start: CONFIG.DEFAULT_SCHEDULED_START,
+    scheduled_hours: CONFIG.DEFAULT_SCHEDULED_HOURS
+  };
+}
+
+/**
+ * その日の実働時間を算出する。
+ *   ・出勤→早退のペアはその区間の時間を積算する
+ *   ・出勤したまま早退が無いセッションは所定終了時刻まで働いたとみなす
+ *   ・区間は所定開始〜所定終了の範囲でクリップする
+ *     （出勤が遅れた分・早退した分だけ所定時間より短くなる）
+ *   ・1日の合計は所定時間数を超えない
+ */
+function computeDayWorkedHours(schedule, businessDateStr, events) {
+  if (!schedule) return '';
+
+  const startStr = normalizeTimeStr(schedule.scheduled_start);
+  const hours = Number(schedule.scheduled_hours);
+  if (!startStr || !isNum(hours)) return '';
+
+  const start = Utilities.parseDate(businessDateStr + ' ' + startStr, CONFIG.TZ, 'yyyy-MM-dd HH:mm');
+  const end = new Date(start.getTime() + hours * 3600000);
+
+  const sorted = events.slice().sort((a, b) => a.punched_at - b.punched_at);
+  let totalMs = 0;
+  let pendingIn = null;
+
+  sorted.forEach(ev => {
+    if (ev.type === 'IN') {
+      if (pendingIn === null) pendingIn = ev.punched_at;
+    } else if (ev.type === 'OUT' && pendingIn !== null) {
+      const s = new Date(Math.max(pendingIn.getTime(), start.getTime()));
+      const e = new Date(Math.min(ev.punched_at.getTime(), end.getTime()));
+      totalMs += Math.max(0, e.getTime() - s.getTime());
+      pendingIn = null;
+    }
+  });
+
+  if (pendingIn !== null) {
+    const s = new Date(Math.max(pendingIn.getTime(), start.getTime()));
+    totalMs += Math.max(0, end.getTime() - s.getTime());
+  }
+
+  const totalHours = Math.min(hours, totalMs / 3600000);
+  return Math.round(totalHours * 100) / 100;
+}
+
+/**
+ * 本人の当日分の打刻をすべて返す（古い順）。
+ * 末尾から遡って集めるので、行数が増えても速度は落ちない。
+ */
+function getTodayEvents(code, businessDateStr) {
   const sh = sheet(SHEETS.EVENTS);
   const lastRow = sh.getLastRow();
-  if (lastRow < 2) return null;
+  if (lastRow < 2) return [];
 
   const t = readHeader(SHEETS.EVENTS);
-  const today = businessDate(new Date());
   const from = Math.max(2, lastRow - 500);
   const values = sh.getRange(from, 1, lastRow - from + 1, sh.getLastColumn()).getValues();
 
-  for (let i = values.length - 1; i >= 0; i--) {
-    const r = values[i];
+  const out = [];
+  for (const r of values) {
     if (String(r[t.col.employee_code]) !== String(code)) continue;
     if (truthy(r[t.col.is_voided])) continue;
-    if (String(r[t.col.business_date]) !== today) continue;
-    return {
-      punch_type: String(r[t.col.punch_type]),
-      punched_at: new Date(r[t.col.punched_at])
-    };
+    if (normalizeDateStr(r[t.col.business_date]) !== businessDateStr) continue;
+    out.push({ type: String(r[t.col.punch_type]), punched_at: new Date(r[t.col.punched_at]) });
   }
-  return null;
+  out.sort((a, b) => a.punched_at - b.punched_at);
+  return out;
+}
+
+function getLastPunchToday(code) {
+  const events = getTodayEvents(code, businessDate(new Date()));
+  if (!events.length) return null;
+  const last = events[events.length - 1];
+  return { punch_type: last.type, punched_at: last.punched_at };
 }
 
 function existsUuid(uuid) {
@@ -394,6 +511,18 @@ function businessDate(d) {
   return Utilities.formatDate(shifted, CONFIG.TZ, 'yyyy-MM-dd');
 }
 
+/** スプレッドシートの日付セルは Date 型で来ることがあるので文字列に揃える */
+function normalizeDateStr(v) {
+  if (v instanceof Date) return Utilities.formatDate(v, CONFIG.TZ, 'yyyy-MM-dd');
+  return String(v || '').trim();
+}
+
+/** 時刻セルも Date 型（1899-12-30 + 時刻）で来ることがあるので HH:mm に揃える */
+function normalizeTimeStr(v) {
+  if (v instanceof Date) return Utilities.formatDate(v, CONFIG.TZ, 'HH:mm');
+  return String(v || '').trim();
+}
+
 /** 2地点間の距離（メートル） */
 function haversine(lat1, lng1, lat2, lng2) {
   const R = 6371000, rad = d => d * Math.PI / 180;
@@ -445,6 +574,7 @@ function logError(err) {
 /**
  * 最初に1回だけ実行する。
  * 必要なシートとヘッダー、ペッパーを作成する。既存シートは壊さない。
+ * 既存シートに新しい列が無ければ末尾に追加する（既存データは保持される）。
  */
 function setup() {
   const ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
@@ -455,11 +585,13 @@ function setup() {
     [SHEETS.DEVICES]:   ['token', 'employee_code', 'registered_at', 'last_used_at', 'label', 'is_active'],
     [SHEETS.LOCATIONS]: ['loc_id', 'name', 'type', 'lat', 'lng', 'radius_m', 'is_active'],
     [SHEETS.EVENTS]:    ['event_id', 'employee_code', 'employee_name', 'loc_id', 'loc_name',
-                         'punched_at', 'punch_type', 'business_date', 'lat', 'lng', 'accuracy_m',
-                         'distance_m', 'geo_status', 'address', 'client_uuid', 'client_time',
-                         'user_agent', 'is_voided'],
+                         'punched_at', 'punch_type', 'category', 'business_date', 'lat', 'lng',
+                         'accuracy_m', 'distance_m', 'geo_status', 'address', 'client_uuid',
+                         'client_time', 'user_agent', 'is_voided', 'worked_hours'],
     [SHEETS.CORRECTIONS]: ['correction_id', 'original_event_id', 'employee_code', 'field',
                            'old_value', 'new_value', 'reason', 'requested_by', 'approved_by', 'corrected_at'],
+    [SHEETS.SCHEDULES]: ['business_date', 'employee_code', 'scheduled_start', 'scheduled_hours', 'note'],
+    [SHEETS.CATEGORIES]: ['category_id', 'label', 'sort_order', 'is_active'],
     'errors': ['at', 'message', 'stack']
   };
 
@@ -470,6 +602,14 @@ function setup() {
       sh.appendRow(defs[name]);
       sh.getRange(1, 1, 1, defs[name].length).setFontWeight('bold');
       sh.setFrozenRows(1);
+    } else {
+      // 既存シートに無い列だけを末尾に追加する（列順の変更・データ削除はしない）
+      const existing = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(String);
+      const missing = defs[name].filter(h => existing.indexOf(h) === -1);
+      if (missing.length) {
+        sh.getRange(1, existing.length + 1, 1, missing.length).setValues([missing]);
+        sh.getRange(1, existing.length + 1, 1, missing.length).setFontWeight('bold');
+      }
     }
   });
 
@@ -485,7 +625,14 @@ function setup() {
     loc.appendRow(['MOBILE_A01', '携帯タグ A', 'PORTABLE', '', '', '', true]);
   }
 
-  Logger.log('セットアップが完了しました。次に addEmployees() を実行してください。');
+  // 見本のカテゴリーを1件入れておく（実際の運用に合わせて書き換える／行を増やす）
+  const cat = ss.getSheetByName(SHEETS.CATEGORIES);
+  if (cat.getLastRow() === 1) {
+    cat.appendRow(['GENERAL', '通常勤務', 1, true]);
+  }
+
+  Logger.log('セットアップが完了しました。次に addEmployees() を実行してください。' +
+             ' schedules シートに日付ごとの所定時間、categories シートにカテゴリーを入力してください。');
 }
 
 /**
