@@ -503,7 +503,10 @@ function done(r, job){
   } else {
     rows.push(['位置', '記録なし']);
   }
-  if (r.day_worked_hours !== undefined && r.day_worked_hours !== '') rows.push(['本日の実働', `${r.day_worked_hours}h`]);
+  if (r.day_worked_hours !== undefined && r.day_worked_hours !== ''){
+    const min = (r.day_worked_minutes !== undefined && r.day_worked_minutes !== '') ? `（${r.day_worked_minutes}分）` : '';
+    rows.push(['本日の実働', `${r.day_worked_hours}h${min}`]);
+  }
   if (r.scheduled_hours !== undefined && r.scheduled_hours !== '') rows.push(['所定時間', `${r.scheduled_hours}h`]);
   $('d-meta').innerHTML = rows.map(([k,v]) =>
     `<div><dt>${k}</dt><dd>${v}</dd></div>`).join('');

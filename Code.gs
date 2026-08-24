@@ -14,6 +14,9 @@
  *   5. schedules シートに日付ごとの所定時間（開始時刻・所定時間数）を手入力する
  *   6. locations シートに練習場所（type = FIXED）を登録する
  *      → 打刻画面の「練習場所」ボタンはここから自動で作られる
+ *   7. installWeeklyTrigger() を1回実行する
+ *      → 毎週月曜3時に、先週（月〜日）の実働時間が社員ごとに
+ *        weekly_summary シートへ自動集計される
  * ══════════════════════════════════════════════════════════════
  */
 
@@ -46,7 +49,8 @@ const SHEETS = {
   LOCATIONS: 'locations',
   EVENTS: 'punch_events',
   CORRECTIONS: 'corrections',
-  SCHEDULES: 'schedules'
+  SCHEDULES: 'schedules',
+  WEEKLY_SUMMARY: 'weekly_summary'
 };
 
 const TYPE_LABEL = {
@@ -252,7 +256,7 @@ function handlePunch(req) {
     const bDate = businessDate(now);
     const todaySoFar = getTodayEvents(emp.employee_code, bDate);
     const schedule = findSchedule(bDate, emp.employee_code);
-    const workedHours = computeDayWorkedHours(
+    const worked = computeDayWorked(
       schedule, bDate, todaySoFar.concat([{ type: type, punched_at: now }]));
 
     // ── 追記 : 時刻はサーバー側を正とする。列名で書き込むので、
@@ -278,7 +282,8 @@ function handlePunch(req) {
       client_time: req.client_time || '',
       user_agent: String(req.ua || '').slice(0, 60),
       is_voided: false,
-      worked_hours: workedHours
+      worked_hours: worked.hours,
+      worked_minutes: worked.minutes
     });
 
     if (req.client_uuid) cache.put(uuidKey, '1', 21600); // 6時間
@@ -292,7 +297,8 @@ function handlePunch(req) {
       distance: distance,
       address: address,
       practice_loc_label: practiceLoc.name,
-      day_worked_hours: workedHours,
+      day_worked_hours: worked.hours,
+      day_worked_minutes: worked.minutes,
       scheduled_hours: schedule ? Number(schedule.scheduled_hours) : ''
     };
 
@@ -389,13 +395,15 @@ function findSchedule(businessDateStr, employeeCode) {
  *   ・区間は所定開始〜所定終了の範囲でクリップする
  *     （出勤が遅れた分・早退した分だけ所定時間より短くなる）
  *   ・1日の合計は所定時間数を超えない
+ * 戻り値は時間(小数2桁)と分(整数)の両方。分は早退者の実働を分単位で
+ * 追えるようにするためのもので、時間の丸めに引きずられない生の値。
  */
-function computeDayWorkedHours(schedule, businessDateStr, events) {
-  if (!schedule) return '';
+function computeDayWorked(schedule, businessDateStr, events) {
+  if (!schedule) return { hours: '', minutes: '' };
 
   const startStr = normalizeTimeStr(schedule.scheduled_start);
   const hours = Number(schedule.scheduled_hours);
-  if (!startStr || !isNum(hours)) return '';
+  if (!startStr || !isNum(hours)) return { hours: '', minutes: '' };
 
   const start = Utilities.parseDate(businessDateStr + ' ' + startStr, CONFIG.TZ, 'yyyy-MM-dd HH:mm');
   const end = new Date(start.getTime() + hours * 3600000);
@@ -420,8 +428,11 @@ function computeDayWorkedHours(schedule, businessDateStr, events) {
     totalMs += Math.max(0, end.getTime() - s.getTime());
   }
 
-  const totalHours = Math.min(hours, totalMs / 3600000);
-  return Math.round(totalHours * 100) / 100;
+  const cappedMs = Math.min(hours * 3600000, totalMs);
+  return {
+    hours: Math.round(cappedMs / 3600000 * 100) / 100,
+    minutes: Math.round(cappedMs / 60000)
+  };
 }
 
 /**
@@ -534,6 +545,20 @@ function businessDate(d) {
   return Utilities.formatDate(shifted, CONFIG.TZ, 'yyyy-MM-dd');
 }
 
+/** 'yyyy-MM-dd' に n 日足す（負数可）。週の集計範囲を求めるのに使う */
+function addDays(dateStr, n) {
+  const d = Utilities.parseDate(dateStr, CONFIG.TZ, 'yyyy-MM-dd');
+  return Utilities.formatDate(new Date(d.getTime() + n * 86400000), CONFIG.TZ, 'yyyy-MM-dd');
+}
+
+/** その日を含む週の月曜日（'yyyy-MM-dd'）を返す */
+function mondayOfWeek(dateStr) {
+  const d = Utilities.parseDate(dateStr, CONFIG.TZ, 'yyyy-MM-dd');
+  const day = d.getDay(); // 0=日,1=月,...6=土
+  const diff = day === 0 ? -6 : 1 - day;
+  return Utilities.formatDate(new Date(d.getTime() + diff * 86400000), CONFIG.TZ, 'yyyy-MM-dd');
+}
+
 /** スプレッドシートの日付セルは Date 型で来ることがあるので文字列に揃える */
 function normalizeDateStr(v) {
   if (v instanceof Date) return Utilities.formatDate(v, CONFIG.TZ, 'yyyy-MM-dd');
@@ -611,10 +636,12 @@ function setup() {
                          'punched_at', 'punch_type', 'practice_loc_id', 'practice_loc_name',
                          'business_date', 'lat', 'lng', 'accuracy_m', 'distance_m', 'geo_status',
                          'address', 'client_uuid', 'client_time', 'user_agent', 'is_voided',
-                         'worked_hours'],
+                         'worked_hours', 'worked_minutes'],
     [SHEETS.CORRECTIONS]: ['correction_id', 'original_event_id', 'employee_code', 'field',
                            'old_value', 'new_value', 'reason', 'requested_by', 'approved_by', 'corrected_at'],
     [SHEETS.SCHEDULES]: ['business_date', 'employee_code', 'scheduled_start', 'scheduled_hours', 'note'],
+    [SHEETS.WEEKLY_SUMMARY]: ['week_start', 'week_end', 'employee_code', 'employee_name',
+                              'worked_hours', 'worked_minutes', 'generated_at'],
     'errors': ['at', 'message', 'stack']
   };
 
@@ -652,7 +679,8 @@ function setup() {
   }
 
   Logger.log('セットアップが完了しました。次に addEmployees() を実行してください。' +
-             ' schedules シートに日付ごとの所定時間、locations シートに練習場所（type=FIXED）を入力してください。');
+             ' schedules シートに日付ごとの所定時間、locations シートに練習場所（type=FIXED）を入力してください。' +
+             ' 週次集計を自動化するには installWeeklyTrigger() を1回実行してください。');
 }
 
 /**
@@ -743,4 +771,98 @@ function voidEvent() {
     corrected_at: new Date()
   });
   Logger.log('取り消しました: ' + eventId);
+}
+
+
+/* ════════════════════════════════════════════
+   8. 週次集計（月〜日）
+   ════════════════════════════════════════════ */
+
+/**
+ * 先週（月〜日）分の実働時間を社員ごとに合算し、weekly_summary に1行ずつ書き出す。
+ * installWeeklyTrigger() で設定した時間主導トリガーから呼ばれる想定。
+ *
+ * 集計の考え方 :
+ *   punch_events の worked_hours / worked_minutes は「打刻するたびに、
+ *   その時点でのその日の実働見込みを丸ごと上書きして記録したもの」なので、
+ *   同じ日・同じ社員の行のうち一番最後（＝appendRow で一番下）の値が
+ *   その日の確定値になる。それを月曜〜日曜ぶん集めて合計する。
+ */
+function buildWeeklySummary() {
+  const today = businessDate(new Date());
+  const thisMonday = mondayOfWeek(today);
+  const weekStart = addDays(thisMonday, -7); // 先週の月曜
+  const weekEnd = addDays(thisMonday, -1);   // 先週の日曜
+
+  const t = readHeader(SHEETS.EVENTS);
+  const lastRow = t.sheet.getLastRow();
+  if (lastRow < 2) {
+    Logger.log('punch_events にデータがありません。');
+    return;
+  }
+
+  const values = t.sheet.getRange(2, 1, lastRow - 1, t.headers.length).getValues();
+
+  // 日付+社員をキーに、その日の最後の行の値で上書きしていく
+  // （appendRow は常に末尾追加＝時系列順なので、最後に残った値がその日の確定値になる）
+  const perDay = {};
+  values.forEach(r => {
+    const bDate = normalizeDateStr(r[t.col.business_date]);
+    if (bDate < weekStart || bDate > weekEnd) return;
+    if (truthy(r[t.col.is_voided])) return;
+
+    const code = String(r[t.col.employee_code]).trim();
+    if (!code) return;
+
+    perDay[bDate + '|' + code] = {
+      name: String(r[t.col.employee_name]),
+      hours: isNum(r[t.col.worked_hours]) ? Number(r[t.col.worked_hours]) : 0,
+      minutes: isNum(r[t.col.worked_minutes]) ? Number(r[t.col.worked_minutes]) : 0
+    };
+  });
+
+  const totals = {};
+  Object.keys(perDay).forEach(key => {
+    const code = key.split('|')[1];
+    const d = perDay[key];
+    if (!totals[code]) totals[code] = { name: d.name, hours: 0, minutes: 0 };
+    totals[code].hours += d.hours;
+    totals[code].minutes += d.minutes;
+  });
+
+  const now = new Date();
+  const codes = Object.keys(totals);
+  codes.forEach(code => {
+    appendRowByHeader(SHEETS.WEEKLY_SUMMARY, {
+      week_start: weekStart,
+      week_end: weekEnd,
+      employee_code: code,
+      employee_name: totals[code].name,
+      worked_hours: Math.round(totals[code].hours * 100) / 100,
+      worked_minutes: totals[code].minutes,
+      generated_at: now
+    });
+  });
+
+  Logger.log(weekStart + '〜' + weekEnd + ' の週次集計を ' + codes.length + ' 名分 weekly_summary に書き出しました。');
+}
+
+/**
+ * 毎週月曜3時（CONFIG.TZ）に buildWeeklySummary() を自動実行するトリガーを設定する。
+ * 初回に1回だけ実行する。既に同じトリガーがあれば削除してから作り直すので、
+ * 何度実行しても二重登録にはならない。
+ */
+function installWeeklyTrigger() {
+  ScriptApp.getProjectTriggers().forEach(tr => {
+    if (tr.getHandlerFunction() === 'buildWeeklySummary') ScriptApp.deleteTrigger(tr);
+  });
+
+  ScriptApp.newTrigger('buildWeeklySummary')
+    .timeBased()
+    .onWeekDay(ScriptApp.WeekDay.MONDAY)
+    .atHour(3)
+    .inTimezone(CONFIG.TZ)
+    .create();
+
+  Logger.log('毎週月曜 3時（' + CONFIG.TZ + '）に buildWeeklySummary() が自動実行されるよう設定しました。');
 }
