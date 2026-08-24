@@ -12,7 +12,8 @@
  *        アクセスできるユーザー: 全員
  *   4. 発行された /exec URL を index.html の CONFIG.API_URL に貼る
  *   5. schedules シートに日付ごとの所定時間（開始時刻・所定時間数）を手入力する
- *   6. categories シートでカテゴリー（label）を実際の運用に合わせて編集する
+ *   6. locations シートに練習場所（type = FIXED）を登録する
+ *      → 打刻画面の「練習場所」ボタンはここから自動で作られる
  * ══════════════════════════════════════════════════════════════
  */
 
@@ -45,8 +46,7 @@ const SHEETS = {
   LOCATIONS: 'locations',
   EVENTS: 'punch_events',
   CORRECTIONS: 'corrections',
-  SCHEDULES: 'schedules',
-  CATEGORIES: 'categories'
+  SCHEDULES: 'schedules'
 };
 
 const TYPE_LABEL = {
@@ -123,10 +123,14 @@ function handleRegister(req) {
   const token = Utilities.getUuid() + Utilities.getUuid().replace(/-/g, '');
   const now = new Date();
 
-  sheet(SHEETS.DEVICES).appendRow([
-    token, emp.employee_code, now, now,
-    String(req.label || '').slice(0, 60), true
-  ]);
+  appendRowByHeader(SHEETS.DEVICES, {
+    token: token,
+    employee_code: emp.employee_code,
+    registered_at: now,
+    last_used_at: now,
+    label: String(req.label || '').slice(0, 60),
+    is_active: true
+  });
 
   return { ok: true, token: token, name: emp.name };
 }
@@ -151,7 +155,7 @@ function handleState(req) {
     loc_name: site.name,
     loc_type: site.type,
     suggest: suggestNext(last),
-    categories: listActiveCategories(),
+    practice_locations: listFixedLocations(),
     last: last ? {
       type: last.punch_type,
       type_label: TYPE_LABEL[last.punch_type] || last.punch_type,
@@ -197,9 +201,9 @@ function handlePunch(req) {
       return { ok: false, error: 'BAD_TYPE', message: '打刻の種別が不正です。' };
     }
 
-    const category = findCategory(req.category);
-    if (!category) {
-      return { ok: false, error: 'BAD_CATEGORY', message: 'カテゴリーを選択してください。' };
+    const practiceLoc = findFixedLocation(req.practice_loc_id);
+    if (!practiceLoc) {
+      return { ok: false, error: 'BAD_PRACTICE_LOC', message: '練習場所を選択してください。' };
     }
 
     // ── 冪等性チェック : オフライン再送で二重に入らないようにする
@@ -251,29 +255,31 @@ function handlePunch(req) {
     const workedHours = computeDayWorkedHours(
       schedule, bDate, todaySoFar.concat([{ type: type, punched_at: now }]));
 
-    // ── 追記 : 時刻はサーバー側を正とする
-    sheet(SHEETS.EVENTS).appendRow([
-      Utilities.getUuid(),
-      emp.employee_code,
-      emp.name,
-      site.loc_id,
-      site.name,
-      now,
-      type,
-      category.category_id,
-      bDate,
-      isNum(geo.lat) ? geo.lat : '',
-      isNum(geo.lng) ? geo.lng : '',
-      isNum(geo.accuracy) ? Math.round(Number(geo.accuracy)) : '',
-      distance,
-      geoStatus,
-      address,
-      req.client_uuid || '',
-      req.client_time || '',
-      String(req.ua || '').slice(0, 60),
-      false,
-      workedHours
-    ]);
+    // ── 追記 : 時刻はサーバー側を正とする。列名で書き込むので、
+    // シートの列順が変わっていても値がずれない。
+    appendRowByHeader(SHEETS.EVENTS, {
+      event_id: Utilities.getUuid(),
+      employee_code: emp.employee_code,
+      employee_name: emp.name,
+      loc_id: site.loc_id,
+      loc_name: site.name,
+      punched_at: now,
+      punch_type: type,
+      practice_loc_id: practiceLoc.loc_id,
+      practice_loc_name: practiceLoc.name,
+      business_date: bDate,
+      lat: isNum(geo.lat) ? geo.lat : '',
+      lng: isNum(geo.lng) ? geo.lng : '',
+      accuracy_m: isNum(geo.accuracy) ? Math.round(Number(geo.accuracy)) : '',
+      distance_m: distance,
+      geo_status: geoStatus,
+      address: address,
+      client_uuid: req.client_uuid || '',
+      client_time: req.client_time || '',
+      user_agent: String(req.ua || '').slice(0, 60),
+      is_voided: false,
+      worked_hours: workedHours
+    });
 
     if (req.client_uuid) cache.put(uuidKey, '1', 21600); // 6時間
 
@@ -285,7 +291,7 @@ function handlePunch(req) {
       geo_status: geoStatus,
       distance: distance,
       address: address,
-      category_label: category.label,
+      practice_loc_label: practiceLoc.name,
       day_worked_hours: workedHours,
       scheduled_hours: schedule ? Number(schedule.scheduled_hours) : ''
     };
@@ -334,22 +340,23 @@ function findLocation(locId) {
   return null;
 }
 
-function findCategory(id) {
-  if (!id) return null;
-  const t = readTable(SHEETS.CATEGORIES);
-  const key = String(id).trim();
-  for (const c of t.rows) {
-    if (String(c.category_id).trim() === key && truthy(c.is_active)) return c;
+/** 練習場所ボタン用。locations シートのうち type が FIXED のものだけを対象にする */
+function findFixedLocation(locId) {
+  if (!locId) return null;
+  const t = readTable(SHEETS.LOCATIONS);
+  const key = String(locId).trim();
+  for (const s of t.rows) {
+    if (String(s.loc_id).trim() === key && truthy(s.is_active) &&
+        String(s.type).trim().toUpperCase() === 'FIXED') return s;
   }
   return null;
 }
 
-function listActiveCategories() {
-  const t = readTable(SHEETS.CATEGORIES);
+function listFixedLocations() {
+  const t = readTable(SHEETS.LOCATIONS);
   return t.rows
-    .filter(c => truthy(c.is_active))
-    .sort((a, b) => (Number(a.sort_order) || 0) - (Number(b.sort_order) || 0))
-    .map(c => ({ id: String(c.category_id), label: String(c.label) }));
+    .filter(s => truthy(s.is_active) && String(s.type).trim().toUpperCase() === 'FIXED')
+    .map(s => ({ id: String(s.loc_id), label: String(s.name) }));
 }
 
 /**
@@ -494,6 +501,22 @@ function readTable(name) {
   return { sheet: t.sheet, col: t.col, headers: t.headers, rows: rows };
 }
 
+/**
+ * ヘッダー名をキーにして1行追加する。
+ * appendRow([...]) のような位置合わせの配列を使わないので、
+ * 過去に列を追加してシートの物理的な列順が定義順とずれていても
+ * 値が誤った列に入らない。
+ */
+function appendRowByHeader(name, valuesObj) {
+  const t = readHeader(name);
+  const row = new Array(t.headers.length).fill('');
+  t.headers.forEach((h, i) => {
+    const key = String(h).trim();
+    if (Object.prototype.hasOwnProperty.call(valuesObj, key)) row[i] = valuesObj[key];
+  });
+  t.sheet.appendRow(row);
+}
+
 /** チェックボックスの true と文字列の "TRUE" の両方を受け付ける */
 function truthy(v) {
   if (v === true) return true;
@@ -585,13 +608,13 @@ function setup() {
     [SHEETS.DEVICES]:   ['token', 'employee_code', 'registered_at', 'last_used_at', 'label', 'is_active'],
     [SHEETS.LOCATIONS]: ['loc_id', 'name', 'type', 'lat', 'lng', 'radius_m', 'is_active'],
     [SHEETS.EVENTS]:    ['event_id', 'employee_code', 'employee_name', 'loc_id', 'loc_name',
-                         'punched_at', 'punch_type', 'category', 'business_date', 'lat', 'lng',
-                         'accuracy_m', 'distance_m', 'geo_status', 'address', 'client_uuid',
-                         'client_time', 'user_agent', 'is_voided', 'worked_hours'],
+                         'punched_at', 'punch_type', 'practice_loc_id', 'practice_loc_name',
+                         'business_date', 'lat', 'lng', 'accuracy_m', 'distance_m', 'geo_status',
+                         'address', 'client_uuid', 'client_time', 'user_agent', 'is_voided',
+                         'worked_hours'],
     [SHEETS.CORRECTIONS]: ['correction_id', 'original_event_id', 'employee_code', 'field',
                            'old_value', 'new_value', 'reason', 'requested_by', 'approved_by', 'corrected_at'],
     [SHEETS.SCHEDULES]: ['business_date', 'employee_code', 'scheduled_start', 'scheduled_hours', 'note'],
-    [SHEETS.CATEGORIES]: ['category_id', 'label', 'sort_order', 'is_active'],
     'errors': ['at', 'message', 'stack']
   };
 
@@ -618,21 +641,18 @@ function setup() {
     props.setProperty('PEPPER', Utilities.getUuid() + Utilities.getUuid());
   }
 
-  // 見本の場所を1件ずつ入れておく（座標は実地で書き換える）
+  // 見本の場所を1件ずつ入れておく（座標は実地で書き換える）。
+  // type が FIXED のものが、そのまま打刻画面の「練習場所」ボタンになる。
   const loc = ss.getSheetByName(SHEETS.LOCATIONS);
   if (loc.getLastRow() === 1) {
-    loc.appendRow(['HQ01', '本社入口', 'FIXED', 1.3521, 103.8198, 100, true]);
-    loc.appendRow(['MOBILE_A01', '携帯タグ A', 'PORTABLE', '', '', '', true]);
-  }
-
-  // 見本のカテゴリーを1件入れておく（実際の運用に合わせて書き換える／行を増やす）
-  const cat = ss.getSheetByName(SHEETS.CATEGORIES);
-  if (cat.getLastRow() === 1) {
-    cat.appendRow(['GENERAL', '通常勤務', 1, true]);
+    appendRowByHeader(SHEETS.LOCATIONS,
+      { loc_id: 'HQ01', name: '本社入口', type: 'FIXED', lat: 1.3521, lng: 103.8198, radius_m: 100, is_active: true });
+    appendRowByHeader(SHEETS.LOCATIONS,
+      { loc_id: 'MOBILE_A01', name: '携帯タグ A', type: 'PORTABLE', lat: '', lng: '', radius_m: '', is_active: true });
   }
 
   Logger.log('セットアップが完了しました。次に addEmployees() を実行してください。' +
-             ' schedules シートに日付ごとの所定時間、categories シートにカテゴリーを入力してください。');
+             ' schedules シートに日付ごとの所定時間、locations シートに練習場所（type=FIXED）を入力してください。');
 }
 
 /**
@@ -646,7 +666,6 @@ function addEmployees() {
     { code: 'E002', name: '鈴木 花子', email: '' }
   ];
 
-  const sh = sheet(SHEETS.EMPLOYEES);
   const out = [];
 
   list.forEach(p => {
@@ -656,7 +675,10 @@ function addEmployees() {
     }
     const pin  = String(Math.floor(100000 + Math.random() * 900000)); // 6桁
     const salt = Utilities.getUuid();
-    sh.appendRow([p.code.toUpperCase(), p.name, p.email || '', salt, hashPin(pin, salt), true]);
+    appendRowByHeader(SHEETS.EMPLOYEES, {
+      employee_code: p.code.toUpperCase(), name: p.name, email: p.email || '',
+      pin_salt: salt, pin_hash: hashPin(pin, salt), is_active: true
+    });
     out.push(p.code + ' / ' + p.name + ' → PIN: ' + pin);
   });
 
@@ -708,9 +730,17 @@ function voidEvent() {
   if (idx < 0) return Logger.log('見つかりません: ' + eventId);
 
   t.sheet.getRange(idx + 2, t.col.is_voided + 1).setValue(true);
-  sheet(SHEETS.CORRECTIONS).appendRow([
-    Utilities.getUuid(), eventId, t.rows[idx].employee_code, 'is_voided',
-    'FALSE', 'TRUE', reason, Session.getActiveUser().getEmail(), '', new Date()
-  ]);
+  appendRowByHeader(SHEETS.CORRECTIONS, {
+    correction_id: Utilities.getUuid(),
+    original_event_id: eventId,
+    employee_code: t.rows[idx].employee_code,
+    field: 'is_voided',
+    old_value: 'FALSE',
+    new_value: 'TRUE',
+    reason: reason,
+    requested_by: Session.getActiveUser().getEmail(),
+    approved_by: '',
+    corrected_at: new Date()
+  });
   Logger.log('取り消しました: ' + eventId);
 }

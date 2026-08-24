@@ -84,8 +84,8 @@
 
   .btn-punch{flex:1 1 0;min-height:76px}
 
-  .cat-row{margin-bottom:6px}
-  .btn-cat{flex:1 1 auto;min-width:0;min-height:48px;padding:10px;font-size:14.5px;font-weight:500}
+  .loc-row{margin-bottom:6px}
+  .btn-loc{flex:1 1 auto;min-width:0;min-height:48px;padding:10px;font-size:14.5px;font-weight:500}
 
   .btn-submit{min-height:56px;background:var(--ink);color:#fff;margin-top:4px}
   .btn-submit:disabled{opacity:.35}
@@ -185,8 +185,8 @@
     <div class="geo pending" id="geo"><span class="dot"></span><span id="geo-text">位置情報を取得しています…</span></div>
     <div id="punch-msg"></div>
 
-    <p class="section-label">カテゴリー</p>
-    <div class="row cat-row" id="cat-row"></div>
+    <p class="section-label">練習場所</p>
+    <div class="row loc-row" id="practice-row"></div>
 
     <p class="section-label">打刻</p>
     <div class="row" style="margin-bottom:14px">
@@ -316,7 +316,7 @@ function paintGeo(geo){
 /* ── 状態 ────────────────────────────── */
 const state = {
   loc:null, token:null, geo:{ status:'PENDING' }, sending:false,
-  categories:[], selectedCategory:null, selectedType:null
+  practiceLocations:[], selectedPracticeLoc:null, selectedType:null
 };
 
 /* ── 起動 ────────────────────────────── */
@@ -340,30 +340,30 @@ async function boot(){
   await openPunch();
 }
 
-/* ── カテゴリー・打刻種別の選択 UI ──────
+/* ── 練習場所・打刻種別の選択 UI ──────
    ボタンは押しても送信されず、選択状態になるだけ。
    実際の送信は btn-submit を押したときに行う。 */
-function renderCategories(){
-  const row = $('cat-row');
+function renderPracticeLocations(){
+  const row = $('practice-row');
   row.innerHTML = '';
-  state.categories.forEach(c => {
+  state.practiceLocations.forEach(loc => {
     const b = document.createElement('button');
     b.type = 'button';
-    b.className = 'btn-toggle btn-cat';
-    b.textContent = c.label;
-    b.dataset.id = c.id;
-    b.onclick = () => selectCategory(c.id);
+    b.className = 'btn-toggle btn-loc';
+    b.textContent = loc.label;
+    b.dataset.id = loc.id;
+    b.onclick = () => selectPracticeLoc(loc.id);
     row.appendChild(b);
   });
-  paintCategorySelection();
+  paintPracticeLocSelection();
 }
-function paintCategorySelection(){
-  $('cat-row').querySelectorAll('.btn-cat').forEach(b =>
-    b.classList.toggle('selected', b.dataset.id === state.selectedCategory));
+function paintPracticeLocSelection(){
+  $('practice-row').querySelectorAll('.btn-loc').forEach(b =>
+    b.classList.toggle('selected', b.dataset.id === state.selectedPracticeLoc));
 }
-function selectCategory(id){
-  state.selectedCategory = id;
-  paintCategorySelection();
+function selectPracticeLoc(id){
+  state.selectedPracticeLoc = id;
+  paintPracticeLocSelection();
   updateSubmitEnabled();
 }
 function selectType(type){
@@ -373,7 +373,7 @@ function selectType(type){
   updateSubmitEnabled();
 }
 function updateSubmitEnabled(){
-  $('btn-submit').disabled = !(state.selectedCategory && state.selectedType) || state.sending;
+  $('btn-submit').disabled = !(state.selectedPracticeLoc && state.selectedType) || state.sending;
 }
 
 async function openPunch(){
@@ -382,7 +382,7 @@ async function openPunch(){
   $('geo').className = 'geo pending';
   $('geo-text').textContent = '位置情報を取得しています…';
 
-  state.selectedCategory = null;
+  state.selectedPracticeLoc = null;
   state.selectedType = null;
   $('btn-in').classList.remove('selected');
   $('btn-out').classList.remove('selected');
@@ -423,8 +423,8 @@ async function openPunch(){
   }
   $('who').textContent = r.name + (r.last ? ` ／ 前回 ${r.last.type_label} ${r.last.at_label}` : ' ／ 本日まだ打刻がありません');
 
-  state.categories = r.categories || [];
-  renderCategories();
+  state.practiceLocations = r.practice_locations || [];
+  renderPracticeLocations();
 
   // 次に押すべきボタンをあらかじめ選択状態にしておく（送信はされない。変更も可能）
   selectType(r.suggest || 'IN');
@@ -432,9 +432,9 @@ async function openPunch(){
 
 /* ── 打刻送信 ───────────────────────── */
 async function submitPunch(){
-  if (state.sending || !state.selectedType || !state.selectedCategory) return;
+  if (state.sending || !state.selectedType || !state.selectedPracticeLoc) return;
   const type = state.selectedType;
-  const category = state.selectedCategory;
+  const practiceLocId = state.selectedPracticeLoc;
 
   state.sending = true;
   $('btn-submit').disabled = true;
@@ -445,7 +445,7 @@ async function submitPunch(){
     token: state.token,
     l: state.loc,
     type: type,
-    category: category,
+    practice_loc_id: practiceLocId,
     geo: state.geo.status === 'PENDING' ? { status:'TIMEOUT' } : state.geo,
     client_uuid: uuid(),
     client_time: new Date().toISOString(),
@@ -467,8 +467,8 @@ async function submitPunch(){
     if (r.error === 'TOO_SOON'){
       return setMsg($('punch-msg'), '直前に同じ打刻があります。二重打刻は記録されていません。', 'warn');
     }
-    if (r.error === 'BAD_CATEGORY'){
-      return setMsg($('punch-msg'), 'カテゴリーを選択してください。', 'warn');
+    if (r.error === 'BAD_PRACTICE_LOC'){
+      return setMsg($('punch-msg'), '練習場所を選択してください。', 'warn');
     }
     if (r.error === 'AUTH'){
       store(TOKEN_KEY, null);
@@ -492,10 +492,10 @@ function done(r, job){
   stamp.textContent = TYPE_LABEL[job.type] || '記録';
   stamp.className = 'stamp ' + (job.type === 'IN' ? 'in' : 'out');
 
-  const catLabel = (state.categories.find(c => c.id === job.category) || {}).label;
+  const locLabel = (state.practiceLocations.find(l => l.id === job.practice_loc_id) || {}).label;
 
   const rows = [['場所', r.loc_name || $('locName').textContent]];
-  if (r.category_label || catLabel) rows.push(['カテゴリー', r.category_label || catLabel]);
+  if (r.practice_loc_label || locLabel) rows.push(['練習場所', r.practice_loc_label || locLabel]);
   if (job.geo.status === 'OK'){
     rows.push(['位置', `±${job.geo.accuracy}m`]);
     if (r.distance !== undefined && r.distance !== '') rows.push(['登録地点から', `${r.distance}m`]);
