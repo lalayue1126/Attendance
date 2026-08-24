@@ -1,10 +1,10 @@
 <!DOCTYPE html>
-<html lang="ja">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#16202B">
-<title>打刻</title>
+<title>Time Clock</title>
 <style>
   :root{
     --ink:#16202B;
@@ -26,14 +26,14 @@
   body{
     background:var(--paper);
     color:var(--ink);
-    font-family:system-ui,-apple-system,"Hiragino Kaku Gothic ProN","Noto Sans JP",sans-serif;
+    font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
     font-size:16px;line-height:1.6;
     min-height:100vh;
     padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom);
   }
   .wrap{max-width:420px;margin:0 auto;padding:0 16px 40px}
 
-  /* ── 場所バンド ── */
+  /* ── Location band ── */
   .band{
     background:var(--ink);color:#fff;
     margin:0 -16px 20px;padding:18px 20px 16px;
@@ -43,13 +43,8 @@
     text-transform:uppercase;color:#8FA2B0;margin:0 0 4px;
   }
   .band .place{font-size:21px;font-weight:600;margin:0;line-height:1.3}
-  .band .kind{
-    display:inline-block;margin-top:8px;padding:2px 9px;
-    border:1px solid #4A5A68;border-radius:3px;
-    font-size:12px;font-family:var(--mono);color:#B9C7D1;
-  }
 
-  /* ── 汎用 ── */
+  /* ── General ── */
   .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:18px}
   h2{font-size:17px;font-weight:600;margin:0 0 6px}
   .note{font-size:13.5px;color:var(--muted);margin:0 0 16px;line-height:1.55}
@@ -72,7 +67,7 @@
 
   .section-label{font-size:13px;font-weight:600;color:var(--ink-soft);margin:0 0 8px}
 
-  /* ── 選択式ボタン（押すと選択状態になるだけで送信はしない） ── */
+  /* ── Selectable buttons (tapping only selects; it does not submit) ── */
   .btn-toggle{
     min-height:64px;padding:12px;background:#fff;color:var(--ink-soft);
     border:1px solid var(--line);
@@ -94,7 +89,7 @@
   .btn-primary{min-height:54px;background:var(--ink);color:#fff}
   .btn-text{min-height:44px;background:none;border:none;color:var(--muted);font-size:14px;font-weight:500;text-decoration:underline}
 
-  /* ── 位置情報ステータス ── */
+  /* ── Location status ── */
   .geo{
     display:flex;align-items:flex-start;gap:9px;
     padding:11px 13px;border-radius:8px;margin-bottom:16px;
@@ -109,7 +104,7 @@
   .geo.warn .dot{background:var(--warn)}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
 
-  /* ── 完了：タイムカードの半券 ── */
+  /* ── Done screen: time-card stub ── */
   .stub{
     position:relative;background:var(--card);
     border:1px solid var(--line);border-left:none;border-radius:0 10px 10px 0;
@@ -149,25 +144,24 @@
 <body>
 <div class="wrap">
 
-  <!-- 場所バンド -->
+  <!-- Location band -->
   <div class="band" id="band">
-    <p class="eyebrow" id="locId">読み込み中</p>
+    <p class="eyebrow" id="locId">Loading</p>
     <p class="place" id="locName">&nbsp;</p>
-    <span class="kind hide" id="locKind"></span>
   </div>
 
-  <!-- 起動中 -->
+  <!-- Booting -->
   <section id="scr-boot" class="card center">
-    <p class="note" style="margin:0">準備しています…</p>
+    <p class="note" style="margin:0">Preparing…</p>
   </section>
 
-  <!-- 端末登録 -->
+  <!-- Device registration -->
   <section id="scr-register" class="card hide">
-    <h2>この端末を登録します</h2>
-    <p class="note">最初の1回だけです。次からはタップするだけで打刻できます。</p>
+    <h2>Register This Device</h2>
+    <p class="note">This is a one-time setup. After this, just tap to check in or out.</p>
     <div id="reg-msg"></div>
     <div class="field">
-      <label for="f-code">社員コード</label>
+      <label for="f-code">Employee Code</label>
       <input id="f-code" type="text" inputmode="latin" autocapitalize="characters"
              autocomplete="off" placeholder="E001">
     </div>
@@ -176,55 +170,55 @@
       <input id="f-pin" type="password" inputmode="numeric" autocomplete="off"
              maxlength="8" placeholder="••••">
     </div>
-    <button class="btn-primary" id="btn-register">登録する</button>
+    <button class="btn-primary" id="btn-register">Register</button>
   </section>
 
-  <!-- 打刻 -->
+  <!-- Punch -->
   <section id="scr-punch" class="hide">
     <p class="who" id="who">&nbsp;</p>
-    <div class="geo pending" id="geo"><span class="dot"></span><span id="geo-text">位置情報を取得しています…</span></div>
+    <div class="geo pending" id="geo"><span class="dot"></span><span id="geo-text">Getting your location…</span></div>
     <div id="punch-msg"></div>
 
-    <p class="section-label">練習場所</p>
+    <p class="section-label">Practice Location</p>
     <div class="row loc-row" id="practice-row"></div>
 
-    <p class="section-label">打刻</p>
+    <p class="section-label">Check In / Out</p>
     <div class="row" style="margin-bottom:14px">
-      <button class="btn-toggle btn-punch" id="btn-in">出勤<span class="sub" id="sub-in">CLOCK IN</span></button>
-      <button class="btn-toggle btn-punch" id="btn-out">早退<span class="sub" id="sub-out">EARLY LEAVE</span></button>
+      <button class="btn-toggle btn-punch" id="btn-in">Check In<span class="sub" id="sub-in"></span></button>
+      <button class="btn-toggle btn-punch" id="btn-out">Leave Early<span class="sub" id="sub-out"></span></button>
     </div>
 
-    <button class="btn-submit" id="btn-submit" disabled>送信する</button>
+    <button class="btn-submit" id="btn-submit" disabled>Submit</button>
 
     <div class="spacer"></div>
-    <button class="btn-text" id="btn-reset">別の人として登録し直す</button>
+    <button class="btn-text" id="btn-reset">Register as a different person</button>
   </section>
 
-  <!-- 完了 -->
+  <!-- Done -->
   <section id="scr-done" class="hide">
     <div class="stub">
-      <span class="stamp" id="d-stamp">記録</span>
+      <span class="stamp" id="d-stamp">Recorded</span>
       <p class="clock" id="d-time">--:--</p>
       <p class="date" id="d-date"></p>
       <dl class="meta" id="d-meta"></dl>
     </div>
     <div class="spacer"></div>
     <div id="done-msg"></div>
-    <button class="btn-text" id="btn-again">続けて打刻する</button>
+    <button class="btn-text" id="btn-again">Check in/out again</button>
   </section>
 
-  <!-- エラー -->
+  <!-- Error -->
   <section id="scr-error" class="card hide">
-    <h2 id="e-title">開けませんでした</h2>
+    <h2 id="e-title">Couldn't Open</h2>
     <p class="note" id="e-body"></p>
-    <button class="btn-primary" id="btn-retry">やり直す</button>
+    <button class="btn-primary" id="btn-retry">Try Again</button>
   </section>
 
 </div>
 
 <script>
 /* ══════════════════════════════════════════
-   設定 — ここだけ書き換えてください
+   Config — edit only this block
    ══════════════════════════════════════════ */
 const CONFIG = {
   API_URL: 'https://script.google.com/macros/s/AKfycbzevhLv-1CXcH3yhRgHTt6v1vQ7opNhP1dEkQzmni_x6tAXnCOIbShW4pjd9Mjs882EBQ/exec',
@@ -235,16 +229,19 @@ const CONFIG = {
 const TOKEN_KEY = 'punch.token';
 const QUEUE_KEY = 'punch.queue';
 
-/* ── 小道具 ─────────────────────────── */
+/* ── Helpers ─────────────────────────── */
 const $ = id => document.getElementById(id);
-const TYPE_LABEL = { IN:'出勤', OUT:'早退' };
+const TYPE_LABEL = { IN:'Check In', OUT:'Leave Early' };
 
 function show(name){
   ['boot','register','punch','done','error'].forEach(s =>
     $('scr-'+s).classList.toggle('hide', s !== name));
 }
 function setMsg(el, text, kind){
-  el.innerHTML = text ? `<div class="msg ${kind||'err'}">${text}</div>` : '';
+  el.innerHTML = text ? `<div class="msg ${kind||'err'}">${esc(text)}</div>` : '';
+}
+function esc(s){
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 function uuid(){
   if (self.crypto && crypto.randomUUID) return crypto.randomUUID();
@@ -252,16 +249,17 @@ function uuid(){
 }
 function store(key, val){
   try { val === null ? localStorage.removeItem(key) : localStorage.setItem(key, val); }
-  catch(e) { /* プライベートブラウズ等では保存されない */ }
+  catch(e) { /* Not persisted in private browsing, etc. */ }
 }
 function load(key){
   try { return localStorage.getItem(key); } catch(e) { return null; }
 }
 
-/* ── 通信 ────────────────────────────
-   Content-Type を text/plain にするのが要点。
-   application/json だとブラウザが OPTIONS を先に送り、
-   GAS はそれを処理できないため必ず CORS エラーになる。 */
+/* ── Networking ────────────────────────────
+   The key point is using Content-Type: text/plain.
+   application/json would make the browser send a preflight
+   OPTIONS request first, which GAS can't handle, so it
+   always results in a CORS error. */
 async function api(payload){
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), CONFIG.FETCH_TIMEOUT_MS);
@@ -279,7 +277,7 @@ async function api(payload){
   }
 }
 
-/* ── 位置情報 ───────────────────────── */
+/* ── Geolocation ───────────────────────── */
 function getPosition(){
   return new Promise(resolve => {
     if (!navigator.geolocation) return resolve({ status:'UNSUPPORTED' });
@@ -302,47 +300,47 @@ function paintGeo(geo){
   if (geo.status === 'OK'){
     box.classList.add(geo.accuracy > 200 ? 'warn' : 'ok');
     txt.textContent = geo.accuracy > 200
-      ? `位置情報の誤差が大きい状態です（±${geo.accuracy}m）。屋外に出ると精度が上がります。`
-      : `位置情報を取得しました（±${geo.accuracy}m）`;
+      ? `Location accuracy is low (±${geo.accuracy}m). Accuracy improves outdoors.`
+      : `Location acquired (±${geo.accuracy}m)`;
   } else if (geo.status === 'DENIED'){
     box.classList.add('warn');
-    txt.textContent = '位置情報がオフです。打刻はできますが、場所は記録されません。';
+    txt.textContent = 'Location is off. You can still check in/out, but your location won’t be recorded.';
   } else {
     box.classList.add('warn');
-    txt.textContent = '位置情報を取得できませんでした。打刻はこのまま進められます。';
+    txt.textContent = 'Couldn’t get your location. You can still continue.';
   }
 }
 
-/* ── 状態 ────────────────────────────── */
+/* ── State ────────────────────────────── */
 const state = {
   loc:null, token:null, geo:{ status:'PENDING' }, sending:false,
   practiceLocations:[], selectedPracticeLoc:null, selectedType:null
 };
 
-/* ── 起動 ────────────────────────────── */
+/* ── Boot ────────────────────────────── */
 async function boot(){
   state.loc = new URLSearchParams(location.search).get('l');
   if (!state.loc){
     $('locId').textContent = '—';
-    $('locName').textContent = '場所が指定されていません';
-    return fail('タグから開いてください',
-      'このページはタグをタップ、またはQRコードを読み取って開きます。ブックマークからは打刻できません。');
+    $('locName').textContent = 'No location specified';
+    return fail('Please open this via the tag',
+      'This page should be opened by tapping the tag or scanning the QR code. It can’t be used from a bookmark.');
   }
   $('locId').textContent = state.loc;
 
-  flushQueue();                      // 前回オフラインで貯めた分を送る
+  flushQueue();                      // Send anything saved offline last time
 
   state.token = load(TOKEN_KEY);
   if (!state.token){
-    $('locName').textContent = '端末の登録';
+    $('locName').textContent = 'Device Registration';
     return show('register');
   }
   await openPunch();
 }
 
-/* ── 練習場所・打刻種別の選択 UI ──────
-   ボタンは押しても送信されず、選択状態になるだけ。
-   実際の送信は btn-submit を押したときに行う。 */
+/* ── Practice location / punch type selection UI ──────
+   Tapping a button only selects it; it doesn't submit.
+   The actual submission happens when btn-submit is pressed. */
 function renderPracticeLocations(){
   const row = $('practice-row');
   row.innerHTML = '';
@@ -380,7 +378,7 @@ async function openPunch(){
   show('punch');
   setMsg($('punch-msg'), '');
   $('geo').className = 'geo pending';
-  $('geo-text').textContent = '位置情報を取得しています…';
+  $('geo-text').textContent = 'Getting your location…';
 
   state.selectedPracticeLoc = null;
   state.selectedType = null;
@@ -388,49 +386,45 @@ async function openPunch(){
   $('btn-out').classList.remove('selected');
   updateSubmitEnabled();
 
-  getPosition().then(g => { state.geo = g; paintGeo(g); });   // 並行で取得
+  getPosition().then(g => { state.geo = g; paintGeo(g); });   // Fetched in parallel
 
   let r;
   try {
     r = await api({ action:'state', token: state.token, l: state.loc });
   } catch(e){
-    $('locName').textContent = '接続できません';
+    $('locName').textContent = 'Can’t Connect';
     setMsg($('punch-msg'),
-      '通信できませんでした。このまま打刻すると端末に保存され、電波が戻ったときに自動で送信されます。', 'warn');
-    $('who').textContent = 'オフライン';
+      'Couldn’t connect. If you check in/out now, it will be saved on this device and sent automatically once you’re back online.', 'warn');
+    $('who').textContent = 'Offline';
     return;
   }
 
   if (!r.ok){
     if (r.error === 'AUTH'){
       store(TOKEN_KEY, null);
-      $('locName').textContent = '端末の登録';
-      setMsg($('reg-msg'), 'この端末の登録が解除されています。もう一度登録してください。', 'warn');
+      $('locName').textContent = 'Device Registration';
+      setMsg($('reg-msg'), 'This device’s registration has been revoked. Please register again.', 'warn');
       return show('register');
     }
-    if (r.error === 'UNKNOWN_LOC'){
-      $('locName').textContent = '未登録の場所';
-      return fail('この場所は登録されていません',
-        `タグの場所ID「${state.loc}」が見つかりません。管理者に連絡してください。`);
+    if (r.error === 'BAD_MODE'){
+      $('locName').textContent = 'Invalid Link';
+      return fail('This Link Is Invalid',
+        'Please open the correct link provided by your administrator (Fixed or Portable).');
     }
-    return fail('打刻できません', r.message || '時間をおいてやり直してください。');
+    return fail('Can’t Check In/Out', r.message || 'Please try again in a moment.');
   }
 
-  $('locName').textContent = r.loc_name || state.loc;
-  if (r.loc_type){
-    $('locKind').textContent = r.loc_type === 'FIXED' ? '固定' : '持ち運び';
-    $('locKind').classList.remove('hide');
-  }
-  $('who').textContent = r.name + (r.last ? ` ／ 前回 ${r.last.type_label} ${r.last.at_label}` : ' ／ 本日まだ打刻がありません');
+  $('locName').textContent = r.loc_mode_label || state.loc;
+  $('who').textContent = r.name + (r.last ? ` · Last: ${r.last.type_label} at ${r.last.at_label}` : ' · No check-ins today yet');
 
   state.practiceLocations = r.practice_locations || [];
   renderPracticeLocations();
 
-  // 次に押すべきボタンをあらかじめ選択状態にしておく（送信はされない。変更も可能）
+  // Pre-select the recommended button (this does not submit; it can still be changed)
   selectType(r.suggest || 'IN');
 }
 
-/* ── 打刻送信 ───────────────────────── */
+/* ── Submit punch ───────────────────────── */
 async function submitPunch(){
   if (state.sending || !state.selectedType || !state.selectedPracticeLoc) return;
   const type = state.selectedType;
@@ -456,7 +450,7 @@ async function submitPunch(){
   try {
     r = await api(job);
   } catch(e){
-    enqueue(job);                                   // オフライン → 端末に保存
+    enqueue(job);                                   // Offline -> save on device
     return done({ ok:true, queued:true, type:type }, job);
   } finally {
     state.sending = false;
@@ -465,61 +459,61 @@ async function submitPunch(){
 
   if (!r.ok){
     if (r.error === 'TOO_SOON'){
-      return setMsg($('punch-msg'), '直前に同じ打刻があります。二重打刻は記録されていません。', 'warn');
+      return setMsg($('punch-msg'), 'You just did the same action. Duplicate check-ins aren’t recorded.', 'warn');
     }
     if (r.error === 'BAD_PRACTICE_LOC'){
-      return setMsg($('punch-msg'), '練習場所を選択してください。', 'warn');
+      return setMsg($('punch-msg'), 'Please select a practice location.', 'warn');
     }
     if (r.error === 'AUTH'){
       store(TOKEN_KEY, null);
       return show('register');
     }
-    return setMsg($('punch-msg'), r.message || '記録できませんでした。もう一度お試しください。', 'err');
+    return setMsg($('punch-msg'), r.message || 'Couldn’t save. Please try again.', 'err');
   }
   done(r, job);
 }
 
-/* ── 完了画面（タイムカードの半券） ── */
+/* ── Done screen (time-card stub) ── */
 function done(r, job){
   const at = r.punched_at ? new Date(r.punched_at) : new Date();
   const p = n => String(n).padStart(2,'0');
-  const week = ['日','月','火','水','木','金','土'][at.getDay()];
+  const week = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][at.getDay()];
 
   $('d-time').textContent = `${p(at.getHours())}:${p(at.getMinutes())}`;
   $('d-date').textContent = `${at.getFullYear()}.${p(at.getMonth()+1)}.${p(at.getDate())} (${week})`;
 
   const stamp = $('d-stamp');
-  stamp.textContent = TYPE_LABEL[job.type] || '記録';
+  stamp.textContent = TYPE_LABEL[job.type] || 'Recorded';
   stamp.className = 'stamp ' + (job.type === 'IN' ? 'in' : 'out');
 
   const locLabel = (state.practiceLocations.find(l => l.id === job.practice_loc_id) || {}).label;
 
-  const rows = [['場所', r.loc_name || $('locName').textContent]];
-  if (r.practice_loc_label || locLabel) rows.push(['練習場所', r.practice_loc_label || locLabel]);
+  const rows = [['Location', r.loc_name || $('locName').textContent]];
+  if (r.practice_loc_label || locLabel) rows.push(['Practice Location', r.practice_loc_label || locLabel]);
   if (job.geo.status === 'OK'){
-    rows.push(['位置', `±${job.geo.accuracy}m`]);
-    if (r.distance !== undefined && r.distance !== '') rows.push(['登録地点から', `${r.distance}m`]);
-    if (r.address) rows.push(['住所', r.address]);
+    rows.push(['GPS', `±${job.geo.accuracy}m`]);
+    if (r.distance !== undefined && r.distance !== '') rows.push(['Distance from location', `${r.distance}m`]);
+    if (r.address) rows.push(['Address', r.address]);
   } else {
-    rows.push(['位置', '記録なし']);
+    rows.push(['GPS', 'Not recorded']);
   }
   if (r.day_worked_hours !== undefined && r.day_worked_hours !== ''){
-    const min = (r.day_worked_minutes !== undefined && r.day_worked_minutes !== '') ? `（${r.day_worked_minutes}分）` : '';
-    rows.push(['本日の実働', `${r.day_worked_hours}h${min}`]);
+    const min = (r.day_worked_minutes !== undefined && r.day_worked_minutes !== '') ? ` (${r.day_worked_minutes} min)` : '';
+    rows.push(["Today's Hours", `${r.day_worked_hours}h${min}`]);
   }
-  if (r.scheduled_hours !== undefined && r.scheduled_hours !== '') rows.push(['所定時間', `${r.scheduled_hours}h`]);
+  if (r.scheduled_hours !== undefined && r.scheduled_hours !== '') rows.push(['Scheduled Hours', `${r.scheduled_hours}h`]);
   $('d-meta').innerHTML = rows.map(([k,v]) =>
-    `<div><dt>${k}</dt><dd>${v}</dd></div>`).join('');
+    `<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`).join('');
 
   let msg = '';
-  if (r.queued) msg = ['この端末に保存しました。電波が戻ると自動で送信されます。','warn'];
-  else if (r.geo_status === 'OUT_OF_RANGE') msg = ['登録地点から離れた場所で打刻されました。記録は残っています。','warn'];
+  if (r.queued) msg = ['Saved on this device. It will be sent automatically once you’re back online.','warn'];
+  else if (r.geo_status === 'OUT_OF_RANGE') msg = ['This check-in was recorded from outside the registered location range. It has still been saved.','warn'];
   setMsg($('done-msg'), msg[0] || '', msg[1]);
 
   show('done');
 }
 
-/* ── オフラインキュー ───────────────── */
+/* ── Offline queue ───────────────── */
 function enqueue(job){
   const q = JSON.parse(load(QUEUE_KEY) || '[]');
   q.push(job);
@@ -530,39 +524,39 @@ async function flushQueue(){
   if (!q.length) return;
   const rest = [];
   for (const job of q){
-    try { await api(job); }          // client_uuid があるので重複送信しても安全
+    try { await api(job); }          // Safe to resend since client_uuid dedupes it
     catch(e){ rest.push(job); }
   }
   store(QUEUE_KEY, rest.length ? JSON.stringify(rest) : null);
 }
 window.addEventListener('online', flushQueue);
 
-/* ── 登録 ────────────────────────────── */
+/* ── Registration ────────────────────────────── */
 async function register(){
   const code = $('f-code').value.trim().toUpperCase();
   const pin  = $('f-pin').value.trim();
   setMsg($('reg-msg'), '');
 
-  if (!code) return setMsg($('reg-msg'), '社員コードを入力してください。');
-  if (!pin)  return setMsg($('reg-msg'), 'PINを入力してください。');
+  if (!code) return setMsg($('reg-msg'), 'Please enter your employee code.');
+  if (!pin)  return setMsg($('reg-msg'), 'Please enter your PIN.');
 
   const btn = $('btn-register');
-  btn.disabled = true; btn.textContent = '登録しています…';
+  btn.disabled = true; btn.textContent = 'Registering…';
   try {
     const r = await api({ action:'register', employee_code:code, pin:pin,
                           label: navigator.userAgent.slice(0, 40) });
     if (!r.ok){
-      const m = { BAD_PIN:'PINが違います。', NOT_FOUND:'この社員コードは登録されていません。' };
-      return setMsg($('reg-msg'), m[r.error] || '登録できませんでした。管理者に連絡してください。');
+      const m = { BAD_PIN:'Incorrect PIN.', NOT_FOUND:'This employee code is not registered.' };
+      return setMsg($('reg-msg'), m[r.error] || 'Couldn’t register. Please contact your administrator.');
     }
     state.token = r.token;
     store(TOKEN_KEY, r.token);
     $('f-pin').value = '';
     await openPunch();
   } catch(e){
-    setMsg($('reg-msg'), '通信できませんでした。電波の良い場所でもう一度お試しください。');
+    setMsg($('reg-msg'), 'Couldn’t connect. Please try again somewhere with a better signal.');
   } finally {
-    btn.disabled = false; btn.textContent = '登録する';
+    btn.disabled = false; btn.textContent = 'Register';
   }
 }
 
@@ -572,7 +566,7 @@ function fail(title, body){
   show('error');
 }
 
-/* ── 配線 ────────────────────────────── */
+/* ── Wiring ────────────────────────────── */
 $('btn-in').onclick  = () => selectType('IN');
 $('btn-out').onclick = () => selectType('OUT');
 $('btn-submit').onclick = submitPunch;
@@ -581,7 +575,7 @@ $('btn-retry').onclick = () => location.reload();
 $('btn-register').onclick = register;
 $('f-pin').addEventListener('keydown', e => { if (e.key === 'Enter') register(); });
 $('btn-reset').onclick = () => {
-  if (confirm('この端末の登録を解除します。次回、社員コードとPINの入力が必要になります。')){
+  if (confirm('This will unregister this device. Next time, you’ll need to enter your employee code and PIN again.')){
     store(TOKEN_KEY, null);
     location.reload();
   }

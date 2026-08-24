@@ -1,22 +1,34 @@
 /**
  * ══════════════════════════════════════════════════════════════
- *  NFC / QR 打刻システム — Google Apps Script バックエンド
+ *  NFC / QR Time Clock System — Google Apps Script backend
  *
- *  対になるフロントエンド : index.html (GitHub Pages)
+ *  Paired frontend: index.html (GitHub Pages)
  *
- *  【最初にやること】
- *   1. CONFIG.SHEET_ID にスプレッドシートIDを入れる
- *   2. メニューから setup() を1回実行する
- *   3. ウェブアプリとしてデプロイ
- *        実行するユーザー   : 自分
- *        アクセスできるユーザー: 全員
- *   4. 発行された /exec URL を index.html の CONFIG.API_URL に貼る
- *   5. schedules シートに日付ごとの所定時間（開始時刻・所定時間数）を手入力する
- *   6. locations シートに練習場所（type = FIXED）を登録する
- *      → 打刻画面の「練習場所」ボタンはここから自動で作られる
- *   7. installWeeklyTrigger() を1回実行する
- *      → 毎週月曜3時に、先週（月〜日）の実働時間が社員ごとに
- *        weekly_summary シートへ自動集計される
+ *  【First-time setup】
+ *   1. Put the spreadsheet ID into CONFIG.SHEET_ID
+ *   2. Run setup() once from the editor
+ *   3. Deploy as a web app
+ *        Execute as: Me
+ *        Who has access: Anyone
+ *   4. Paste the issued /exec URL into CONFIG.API_URL in index.html
+ *   5. Enter each date's scheduled hours (start time + hours) into the
+ *      schedules sheet by hand
+ *   6. Register practice locations in the locations sheet (type is
+ *      either FIXED or PORTABLE)
+ *      → The "Practice Location" buttons on the punch screen are built
+ *        from this automatically. FIXED locations are GPS-checked;
+ *        PORTABLE locations are not (only the address is recorded).
+ *   7. Run installWeeklyTrigger() once
+ *      → Every Monday at 3am, last week's (Mon–Sun) worked hours per
+ *        employee are automatically summarized into weekly_summary
+ *
+ *  【Only 2 links are distributed to staff】
+ *   Fixed locations : index.html?l=FIXED     (one shared link for all fixed sites)
+ *   Portable        : index.html?l=PORTABLE
+ *   l is not a specific location ID — it's one of these two mode names.
+ *   Either link then lets staff pick the actual place from the
+ *   "Practice Location" buttons, sourced from locations rows matching
+ *   that type.
  * ══════════════════════════════════════════════════════════════
  */
 
@@ -25,20 +37,20 @@ const CONFIG = {
 
   TZ: 'Asia/Singapore',
 
-  // 勤務日の境界。4 なら 00:00〜03:59 の打刻は前日の勤務として扱う
+  // Business-day boundary. With 4, punches between 00:00–03:59 count as the previous day.
   DAY_BOUNDARY_HOUR: 4,
 
-  // 同一種別の連続打刻をこの秒数内は無視する（誤タップ・二重読み対策）
+  // Ignore a repeat of the same punch type within this many seconds (mis-taps / double reads).
   DEDUP_WINDOW_SEC: 60,
 
-  // FIXED 拠点の既定半径（locations の radius_m が空のとき使用）
+  // Default radius for FIXED locations (used when locations.radius_m is blank).
   DEFAULT_RADIUS_M: 100,
 
-  // 逆ジオコーディング（PORTABLE のみ）。不要なら false
+  // Reverse geocoding (PORTABLE only). Set to false if not needed.
   REVERSE_GEOCODE: true,
 
-  // schedules シートにその日の行が無いときだけ使う既定の所定時間
-  // （本来は日付ごとに schedules シートへ手入力する運用のための保険）
+  // Fallback schedule used only when the schedules sheet has no row for that day
+  // (a safety net for the normal workflow of entering hours per date by hand).
   DEFAULT_SCHEDULED_START: '09:00',
   DEFAULT_SCHEDULED_HOURS: 8
 };
@@ -54,18 +66,22 @@ const SHEETS = {
 };
 
 const TYPE_LABEL = {
-  IN: '出勤', OUT: '早退'
+  IN: 'Check In', OUT: 'Leave Early'
+};
+
+const MODE_LABEL = {
+  FIXED: 'Fixed', PORTABLE: 'Portable'
 };
 
 
 /* ════════════════════════════════════════════
-   1. エントリポイント
+   1. Entry points
    ════════════════════════════════════════════ */
 
 function doPost(e) {
   try {
     if (!e || !e.postData || !e.postData.contents) {
-      return json({ ok: false, error: 'BAD_REQUEST', message: 'リクエストが空です。' });
+      return json({ ok: false, error: 'BAD_REQUEST', message: 'The request was empty.' });
     }
 
     const req = JSON.parse(e.postData.contents);
@@ -75,22 +91,22 @@ function doPost(e) {
       case 'state':    return json(handleState(req));
       case 'punch':    return json(handlePunch(req));
       default:
-        return json({ ok: false, error: 'BAD_ACTION', message: '不明な操作です。' });
+        return json({ ok: false, error: 'BAD_ACTION', message: 'Unknown action.' });
     }
 
   } catch (err) {
-    // 例外を握りつぶさず記録する。原因調査で必ず要る。
+    // Never swallow the exception silently — logging is essential for debugging.
     logError(err);
     return json({
       ok: false, error: 'SERVER',
-      message: 'サーバー側でエラーが発生しました。管理者に連絡してください。'
+      message: 'A server error occurred. Please contact your administrator.'
     });
   }
 }
 
 /**
- * doGet は打刻には使わないが、デプロイ確認用に生かしておく。
- * ブラウザで /exec を開いて {"ok":true,...} が出れば公開設定は正しい。
+ * doGet isn't used for punching, but is kept for deployment verification.
+ * Opening /exec in a browser and seeing {"ok":true,...} confirms the deployment is public.
  */
 function doGet() {
   return json({ ok: true, service: 'punch-api', time: new Date().toISOString() });
@@ -104,7 +120,7 @@ function json(obj) {
 
 
 /* ════════════════════════════════════════════
-   2. 端末登録
+   2. Device registration
    ════════════════════════════════════════════ */
 
 function handleRegister(req) {
@@ -141,25 +157,25 @@ function handleRegister(req) {
 
 
 /* ════════════════════════════════════════════
-   3. 打刻画面の初期表示
+   3. Initial state for the punch screen
    ════════════════════════════════════════════ */
 
 function handleState(req) {
   const emp = authenticate(req.token);
   if (!emp) return { ok: false, error: 'AUTH' };
 
-  const site = findLocation(req.l);
-  if (!site) return { ok: false, error: 'UNKNOWN_LOC' };
+  const mode = validateMode(req.l);
+  if (!mode) return { ok: false, error: 'BAD_MODE' };
 
   const last = getLastPunchToday(emp.employee_code);
 
   return {
     ok: true,
     name: emp.name,
-    loc_name: site.name,
-    loc_type: site.type,
+    loc_mode: mode,
+    loc_mode_label: MODE_LABEL[mode],
     suggest: suggestNext(last),
-    practice_locations: listFixedLocations(),
+    practice_locations: listLocationsByType(mode),
     last: last ? {
       type: last.punch_type,
       type_label: TYPE_LABEL[last.punch_type] || last.punch_type,
@@ -169,9 +185,9 @@ function handleState(req) {
 }
 
 /**
- * 次に押すべき打刻種別を推定する。
- * あくまで「おすすめ」であり、確定はしない。
- * 自動確定にすると打刻漏れ1回で以降すべてが反転してしまう。
+ * Guesses which punch type should come next.
+ * This is only a suggestion, never auto-confirmed —
+ * auto-confirming would flip every subsequent punch after a single missed one.
  */
 function suggestNext(last) {
   if (!last) return 'IN';
@@ -180,52 +196,53 @@ function suggestNext(last) {
 
 
 /* ════════════════════════════════════════════
-   4. 打刻の記録
+   4. Recording a punch
    ════════════════════════════════════════════ */
 
 function handlePunch(req) {
   const lock = LockService.getScriptLock();
 
-  // 同時打刻で行が壊れるのを防ぐ。取れなければ諦めて再試行を促す。
+  // Prevents concurrent punches from corrupting a row. Give up and ask the client to retry if the lock can't be acquired.
   try {
     lock.waitLock(20000);
   } catch (e) {
-    return { ok: false, error: 'BUSY', message: '混み合っています。もう一度お試しください。' };
+    return { ok: false, error: 'BUSY', message: 'The system is busy. Please try again.' };
   }
 
   try {
     const emp = authenticate(req.token);
     if (!emp) return { ok: false, error: 'AUTH' };
 
-    const site = findLocation(req.l);
-    if (!site) return { ok: false, error: 'UNKNOWN_LOC' };
+    const mode = validateMode(req.l);
+    if (!mode) return { ok: false, error: 'BAD_MODE' };
 
     const type = String(req.type || '').toUpperCase();
     if (!TYPE_LABEL[type]) {
-      return { ok: false, error: 'BAD_TYPE', message: '打刻の種別が不正です。' };
+      return { ok: false, error: 'BAD_TYPE', message: 'Invalid punch type.' };
     }
 
-    const practiceLoc = findFixedLocation(req.practice_loc_id);
+    const practiceLoc = findLocationByType(req.practice_loc_id, mode);
     if (!practiceLoc) {
-      return { ok: false, error: 'BAD_PRACTICE_LOC', message: '練習場所を選択してください。' };
+      return { ok: false, error: 'BAD_PRACTICE_LOC', message: 'Please select a practice location.' };
     }
 
-    // ── 冪等性チェック : オフライン再送で二重に入らないようにする
+    // ── Idempotency check: prevents an offline retry from being recorded twice
     const uuidKey = 'uuid:' + req.client_uuid;
     const cache = CacheService.getScriptCache();
     if (req.client_uuid && (cache.get(uuidKey) || existsUuid(req.client_uuid))) {
       return { ok: true, dedup: true, punched_at: new Date().toISOString(),
-               loc_name: site.name, geo_status: 'OK' };
+               loc_name: MODE_LABEL[mode], geo_status: 'OK' };
     }
 
-    // ── 誤タップ対策 : 直近の同一種別を無視
+    // ── Mis-tap guard: ignore an immediate repeat of the same punch type
     const last = getLastPunchToday(emp.employee_code);
     if (last && last.punch_type === type &&
         (new Date() - last.punched_at) < CONFIG.DEDUP_WINDOW_SEC * 1000) {
       return { ok: false, error: 'TOO_SOON' };
     }
 
-    // ── 位置情報の判定 : ここで固定 / 持ち運びが分岐する
+    // ── Location check: FIXED is verified against the coordinates of the
+    // selected practice location; PORTABLE isn't verified, only the address is recorded.
     const geo = req.geo || { status: 'TIMEOUT' };
     let geoStatus = String(geo.status || 'TIMEOUT');
     let distance = '';
@@ -233,25 +250,26 @@ function handlePunch(req) {
 
     if (geoStatus === 'OK' && isNum(geo.lat) && isNum(geo.lng)) {
 
-      if (site.type === 'FIXED' && isNum(site.lat) && isNum(site.lng)) {
-        const radius = isNum(site.radius_m) ? Number(site.radius_m) : CONFIG.DEFAULT_RADIUS_M;
-        distance = haversine(geo.lat, geo.lng, Number(site.lat), Number(site.lng));
+      if (mode === 'FIXED' && isNum(practiceLoc.lat) && isNum(practiceLoc.lng)) {
+        const radius = isNum(practiceLoc.radius_m) ? Number(practiceLoc.radius_m) : CONFIG.DEFAULT_RADIUS_M;
+        distance = haversine(geo.lat, geo.lng, Number(practiceLoc.lat), Number(practiceLoc.lng));
 
-        // GPS 誤差を許容範囲に加算する。
-        // これをやらないと屋内 Wi-Fi 測位で正当な打刻が大量に弾かれる。
+        // Add GPS error margin to the allowed radius.
+        // Without this, legitimate indoor Wi-Fi-based positioning gets rejected constantly.
         const tolerance = radius + Math.min(Number(geo.accuracy) || 0, 300);
         geoStatus = distance <= tolerance ? 'OK' : 'OUT_OF_RANGE';
 
       } else {
-        // PORTABLE は検証せず、どこで打刻したかを住所として残す
+        // PORTABLE, or a practice location without coordinates set: skip verification, just log the address.
         address = CONFIG.REVERSE_GEOCODE ? reverseGeocode(geo.lat, geo.lng) : '';
       }
     }
 
-    // ── 実働時間の算出
-    // 出勤のみ（早退なし）なら所定時間まるごと働いたものとして扱い、
-    // 出勤が遅れた／早退した分だけ所定時間から差し引く。
-    // 1日に複数回の出勤・早退（分割シフト）にも対応する。
+    // ── Compute worked hours.
+    // If there's a Check In with no Leave Early, the employee is treated as having
+    // worked the full scheduled hours. Arriving late or leaving early both reduce
+    // the total. Multiple Check In / Leave Early pairs in one day (split shifts)
+    // are supported.
     const now = new Date();
     const bDate = businessDate(now);
     const todaySoFar = getTodayEvents(emp.employee_code, bDate);
@@ -259,14 +277,15 @@ function handlePunch(req) {
     const worked = computeDayWorked(
       schedule, bDate, todaySoFar.concat([{ type: type, punched_at: now }]));
 
-    // ── 追記 : 時刻はサーバー側を正とする。列名で書き込むので、
-    // シートの列順が変わっていても値がずれない。
+    // ── Append the row. The server clock is authoritative for the timestamp.
+    // Writing by header name means the values stay correct even if the sheet's
+    // physical column order has drifted from the definition order.
     appendRowByHeader(SHEETS.EVENTS, {
       event_id: Utilities.getUuid(),
       employee_code: emp.employee_code,
       employee_name: emp.name,
-      loc_id: site.loc_id,
-      loc_name: site.name,
+      loc_id: mode,
+      loc_name: MODE_LABEL[mode],
       punched_at: now,
       punch_type: type,
       practice_loc_id: practiceLoc.loc_id,
@@ -286,13 +305,13 @@ function handlePunch(req) {
       worked_minutes: worked.minutes
     });
 
-    if (req.client_uuid) cache.put(uuidKey, '1', 21600); // 6時間
+    if (req.client_uuid) cache.put(uuidKey, '1', 21600); // 6 hours
 
     return {
       ok: true,
       type: type,
       punched_at: now.toISOString(),
-      loc_name: site.name,
+      loc_name: MODE_LABEL[mode],
       geo_status: geoStatus,
       distance: distance,
       address: address,
@@ -309,7 +328,7 @@ function handlePunch(req) {
 
 
 /* ════════════════════════════════════════════
-   5. 認証とデータ取得
+   5. Authentication and data lookups
    ════════════════════════════════════════════ */
 
 function authenticate(token) {
@@ -319,7 +338,7 @@ function authenticate(token) {
   for (let i = 0; i < t.rows.length; i++) {
     const d = t.rows[i];
     if (String(d.token) === String(token) && truthy(d.is_active)) {
-      // 最終利用日時を更新（休眠端末の把握に使う）
+      // Update last-used timestamp (used to spot dormant devices).
       t.sheet.getRange(i + 2, t.col.last_used_at + 1).setValue(new Date());
       return findEmployee(d.employee_code);
     }
@@ -336,50 +355,66 @@ function findEmployee(code) {
   return null;
 }
 
-function findLocation(locId) {
-  if (!locId) return null;
-  const t = readTable(SHEETS.LOCATIONS);
-  const key = String(locId).trim();
-  for (const s of t.rows) {
-    if (String(s.loc_id).trim() === key && truthy(s.is_active)) return s;
-  }
-  return null;
+/**
+ * The l parameter is not a specific location ID — it represents the link's
+ * mode (FIXED / PORTABLE). Since only these two shared links are distributed,
+ * we validate the mode string directly instead of looking up an individual
+ * row in the locations sheet.
+ */
+function validateMode(l) {
+  const m = String(l || '').trim().toUpperCase();
+  return (m === 'FIXED' || m === 'PORTABLE') ? m : null;
 }
 
-/** 練習場所ボタン用。locations シートのうち type が FIXED のものだけを対象にする */
-function findFixedLocation(locId) {
+/** For the practice-location buttons. Only locations rows whose type matches the link's mode are considered. */
+function findLocationByType(locId, type) {
   if (!locId) return null;
   const t = readTable(SHEETS.LOCATIONS);
   const key = String(locId).trim();
   for (const s of t.rows) {
     if (String(s.loc_id).trim() === key && truthy(s.is_active) &&
-        String(s.type).trim().toUpperCase() === 'FIXED') return s;
+        String(s.type).trim().toUpperCase() === type) return s;
   }
   return null;
 }
 
-function listFixedLocations() {
+function listLocationsByType(type) {
   const t = readTable(SHEETS.LOCATIONS);
   return t.rows
-    .filter(s => truthy(s.is_active) && String(s.type).trim().toUpperCase() === 'FIXED')
+    .filter(s => truthy(s.is_active) && String(s.type).trim().toUpperCase() === type)
     .map(s => ({ id: String(s.loc_id), label: String(s.name) }));
 }
 
 /**
- * その日・その社員の所定時間を探す。
- * 個人別の行を優先し、無ければ employee_code が空の「全員共通」行を使う。
- * どちらも無い場合は CONFIG の既定値で計算を続行する（保険）。
+ * Treats a row as "not filled in" if scheduled_start / scheduled_hours is blank or invalid.
+ * Using such a row as-is would silently leave that day's worked hours blank.
+ */
+function isValidSchedule(r) {
+  const startStr = normalizeTimeStr(r.scheduled_start);
+  const hours = Number(r.scheduled_hours);
+  return !!startStr && r.scheduled_hours !== '' && r.scheduled_hours !== null &&
+         r.scheduled_hours !== undefined && isNum(hours) && hours > 0;
+}
+
+/**
+ * Finds the scheduled hours for a given day and employee.
+ * A personal row takes priority; otherwise the "everyone" row (blank employee_code) is used.
+ * Rows with a blank/invalid start time or hours are skipped in favor of the next candidate.
+ * If none are found, falls back to the CONFIG default (a safety net).
  */
 function findSchedule(businessDateStr, employeeCode) {
   const t = readTable(SHEETS.SCHEDULES);
-  let fallback = null;
+  let personal = null;
+  let blanket = null;
   for (const r of t.rows) {
     if (normalizeDateStr(r.business_date) !== businessDateStr) continue;
+    if (!isValidSchedule(r)) continue;
     const code = String(r.employee_code || '').trim().toUpperCase();
-    if (code === String(employeeCode).trim().toUpperCase()) return r;
-    if (!code) fallback = r;
+    if (code === String(employeeCode).trim().toUpperCase()) personal = r;
+    else if (!code) blanket = r;
   }
-  if (fallback) return fallback;
+  if (personal) return personal;
+  if (blanket) return blanket;
   return {
     business_date: businessDateStr,
     employee_code: '',
@@ -389,14 +424,16 @@ function findSchedule(businessDateStr, employeeCode) {
 }
 
 /**
- * その日の実働時間を算出する。
- *   ・出勤→早退のペアはその区間の時間を積算する
- *   ・出勤したまま早退が無いセッションは所定終了時刻まで働いたとみなす
- *   ・区間は所定開始〜所定終了の範囲でクリップする
- *     （出勤が遅れた分・早退した分だけ所定時間より短くなる）
- *   ・1日の合計は所定時間数を超えない
- * 戻り値は時間(小数2桁)と分(整数)の両方。分は早退者の実働を分単位で
- * 追えるようにするためのもので、時間の丸めに引きずられない生の値。
+ * Computes worked hours for the day.
+ *   - Each Check In → Leave Early pair adds up the time in that window.
+ *   - A Check In with no matching Leave Early is assumed to run until the
+ *     scheduled end time.
+ *   - Every window is clipped to [scheduled start, scheduled end]
+ *     (arriving late or leaving early both shrink it below the scheduled hours).
+ *   - The day's total never exceeds the scheduled hours.
+ * Returns both hours (2 decimal places) and minutes (integer). Minutes is the
+ * raw value, useful for tracking early leavers precisely without being
+ * rounded away by the hours figure.
  */
 function computeDayWorked(schedule, businessDateStr, events) {
   if (!schedule) return { hours: '', minutes: '' };
@@ -436,8 +473,9 @@ function computeDayWorked(schedule, businessDateStr, events) {
 }
 
 /**
- * 本人の当日分の打刻をすべて返す（古い順）。
- * 末尾から遡って集めるので、行数が増えても速度は落ちない。
+ * Returns all of this employee's punches for today, oldest first.
+ * Scans backward from the end of the sheet, so performance doesn't
+ * degrade as the row count grows.
  */
 function getTodayEvents(code, businessDateStr) {
   const sh = sheet(SHEETS.EVENTS);
@@ -479,16 +517,16 @@ function existsUuid(uuid) {
 
 
 /* ════════════════════════════════════════════
-   6. ユーティリティ
+   6. Utilities
    ════════════════════════════════════════════ */
 
 function sheet(name) {
   const sh = SpreadsheetApp.openById(CONFIG.SHEET_ID).getSheetByName(name);
-  if (!sh) throw new Error('シートが見つかりません: ' + name + ' → setup() を実行してください');
+  if (!sh) throw new Error('Sheet not found: ' + name + ' → run setup()');
   return sh;
 }
 
-/** ヘッダー行から列名→インデックスの対応を作る（列順を変えても壊れないようにする） */
+/** Builds a column-name → index map from the header row (so column reordering doesn't break anything). */
 function readHeader(name) {
   const sh = sheet(name);
   const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
@@ -513,10 +551,9 @@ function readTable(name) {
 }
 
 /**
- * ヘッダー名をキーにして1行追加する。
- * appendRow([...]) のような位置合わせの配列を使わないので、
- * 過去に列を追加してシートの物理的な列順が定義順とずれていても
- * 値が誤った列に入らない。
+ * Appends a row keyed by header name, instead of a positional appendRow([...]) array,
+ * so values still land in the right column even if the sheet's physical column
+ * order has drifted from the definition order after past column additions.
  */
 function appendRowByHeader(name, valuesObj) {
   const t = readHeader(name);
@@ -528,7 +565,7 @@ function appendRowByHeader(name, valuesObj) {
   t.sheet.appendRow(row);
 }
 
-/** チェックボックスの true と文字列の "TRUE" の両方を受け付ける */
+/** Accepts both a real checkbox true and the string "TRUE". */
 function truthy(v) {
   if (v === true) return true;
   const s = String(v).trim().toUpperCase();
@@ -539,39 +576,39 @@ function isNum(v) {
   return v !== null && v !== undefined && v !== '' && !isNaN(Number(v));
 }
 
-/** 勤務日。境界時刻より前の打刻は前日扱いにする（夜勤・日跨ぎ対応） */
+/** Business day. Punches before the boundary hour count as the previous day (for night shifts crossing midnight). */
 function businessDate(d) {
   const shifted = new Date(d.getTime() - CONFIG.DAY_BOUNDARY_HOUR * 3600 * 1000);
   return Utilities.formatDate(shifted, CONFIG.TZ, 'yyyy-MM-dd');
 }
 
-/** 'yyyy-MM-dd' に n 日足す（負数可）。週の集計範囲を求めるのに使う */
+/** Adds n days (can be negative) to a 'yyyy-MM-dd' string. Used to compute the weekly summary range. */
 function addDays(dateStr, n) {
   const d = Utilities.parseDate(dateStr, CONFIG.TZ, 'yyyy-MM-dd');
   return Utilities.formatDate(new Date(d.getTime() + n * 86400000), CONFIG.TZ, 'yyyy-MM-dd');
 }
 
-/** その日を含む週の月曜日（'yyyy-MM-dd'）を返す */
+/** Returns the Monday ('yyyy-MM-dd') of the week containing this date. */
 function mondayOfWeek(dateStr) {
   const d = Utilities.parseDate(dateStr, CONFIG.TZ, 'yyyy-MM-dd');
-  const day = d.getDay(); // 0=日,1=月,...6=土
+  const day = d.getDay(); // 0=Sun,1=Mon,...6=Sat
   const diff = day === 0 ? -6 : 1 - day;
   return Utilities.formatDate(new Date(d.getTime() + diff * 86400000), CONFIG.TZ, 'yyyy-MM-dd');
 }
 
-/** スプレッドシートの日付セルは Date 型で来ることがあるので文字列に揃える */
+/** Spreadsheet date cells can come back as a Date object, so normalize to a plain string. */
 function normalizeDateStr(v) {
   if (v instanceof Date) return Utilities.formatDate(v, CONFIG.TZ, 'yyyy-MM-dd');
   return String(v || '').trim();
 }
 
-/** 時刻セルも Date 型（1899-12-30 + 時刻）で来ることがあるので HH:mm に揃える */
+/** Time cells can also come back as a Date object (1899-12-30 + time), so normalize to HH:mm. */
 function normalizeTimeStr(v) {
   if (v instanceof Date) return Utilities.formatDate(v, CONFIG.TZ, 'HH:mm');
   return String(v || '').trim();
 }
 
-/** 2地点間の距離（メートル） */
+/** Distance between two points, in meters. */
 function haversine(lat1, lng1, lat2, lng2) {
   const R = 6371000, rad = d => d * Math.PI / 180;
   const dLat = rad(lat2 - lat1), dLng = rad(lng2 - lng1);
@@ -580,7 +617,7 @@ function haversine(lat1, lng1, lat2, lng2) {
   return Math.round(R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
 }
 
-/** 逆ジオコーディング。失敗しても打刻は止めない */
+/** Reverse geocoding. A failure here must never block the punch itself. */
 function reverseGeocode(lat, lng) {
   const key = 'geo:' + Number(lat).toFixed(4) + ',' + Number(lng).toFixed(4);
   const cache = CacheService.getScriptCache();
@@ -588,7 +625,7 @@ function reverseGeocode(lat, lng) {
   if (hit !== null) return hit;
 
   try {
-    const res = Maps.newGeocoder().setLanguage('ja').reverseGeocode(lat, lng);
+    const res = Maps.newGeocoder().setLanguage('en').reverseGeocode(lat, lng);
     const addr = (res.results && res.results[0]) ? res.results[0].formatted_address : '';
     cache.put(key, addr, 21600);
     return addr;
@@ -597,7 +634,7 @@ function reverseGeocode(lat, lng) {
   }
 }
 
-/** PIN は平文で保存しない。ソルト＋ペッパー付き SHA-256 */
+/** PINs are never stored in plain text — salted + peppered SHA-256. */
 function hashPin(pin, salt) {
   const pepper = PropertiesService.getScriptProperties().getProperty('PEPPER') || '';
   const raw = String(salt) + '|' + String(pin) + '|' + pepper;
@@ -611,18 +648,18 @@ function logError(err) {
   try {
     const sh = SpreadsheetApp.openById(CONFIG.SHEET_ID).getSheetByName('errors');
     if (sh) sh.appendRow([new Date(), String(err.message || err), String(err.stack || '')]);
-  } catch (e) { /* ログ失敗で本処理を止めない */ }
+  } catch (e) { /* A logging failure must not stop the main flow. */ }
 }
 
 
 /* ════════════════════════════════════════════
-   7. 初期セットアップ（エディタから手動実行）
+   7. Initial setup (run manually from the editor)
    ════════════════════════════════════════════ */
 
 /**
- * 最初に1回だけ実行する。
- * 必要なシートとヘッダー、ペッパーを作成する。既存シートは壊さない。
- * 既存シートに新しい列が無ければ末尾に追加する（既存データは保持される）。
+ * Run this once, the first time.
+ * Creates the required sheets, headers, and pepper. Never touches an existing sheet's data.
+ * If an existing sheet is missing a column, it's appended at the end (existing data is preserved).
  */
 function setup() {
   const ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
@@ -653,7 +690,7 @@ function setup() {
       sh.getRange(1, 1, 1, defs[name].length).setFontWeight('bold');
       sh.setFrozenRows(1);
     } else {
-      // 既存シートに無い列だけを末尾に追加する（列順の変更・データ削除はしない）
+      // Append only the columns missing from an existing sheet (never reorders or deletes data).
       const existing = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(String);
       const missing = defs[name].filter(h => existing.indexOf(h) === -1);
       if (missing.length) {
@@ -668,40 +705,40 @@ function setup() {
     props.setProperty('PEPPER', Utilities.getUuid() + Utilities.getUuid());
   }
 
-  // 見本の場所を1件ずつ入れておく（座標は実地で書き換える）。
-  // type が FIXED のものが、そのまま打刻画面の「練習場所」ボタンになる。
+  // Seed one sample practice location of each type (edit the coordinates for the real site).
+  // A FIXED row shows up on the l=FIXED link; a PORTABLE row shows up on the l=PORTABLE link.
   const loc = ss.getSheetByName(SHEETS.LOCATIONS);
   if (loc.getLastRow() === 1) {
     appendRowByHeader(SHEETS.LOCATIONS,
-      { loc_id: 'HQ01', name: '本社入口', type: 'FIXED', lat: 1.3521, lng: 103.8198, radius_m: 100, is_active: true });
+      { loc_id: 'HQ01', name: 'Main Entrance', type: 'FIXED', lat: 1.3521, lng: 103.8198, radius_m: 100, is_active: true });
     appendRowByHeader(SHEETS.LOCATIONS,
-      { loc_id: 'MOBILE_A01', name: '携帯タグ A', type: 'PORTABLE', lat: '', lng: '', radius_m: '', is_active: true });
+      { loc_id: 'MOBILE_A01', name: 'Off-site A', type: 'PORTABLE', lat: '', lng: '', radius_m: '', is_active: true });
   }
 
-  Logger.log('セットアップが完了しました。次に addEmployees() を実行してください。' +
-             ' schedules シートに日付ごとの所定時間、locations シートに練習場所（type=FIXED）を入力してください。' +
-             ' 週次集計を自動化するには installWeeklyTrigger() を1回実行してください。');
+  Logger.log('Setup complete. Run addEmployees() next.' +
+             ' Enter each date\'s scheduled hours into the schedules sheet, and practice locations (type=FIXED/PORTABLE) into the locations sheet.' +
+             ' To automate the weekly summary, run installWeeklyTrigger() once.');
 }
 
 /**
- * 社員を一括登録し、初期PINを発行する。
- * 下の list を書き換えてから実行し、ログに出るPINを本人に配布する。
- * PIN はハッシュ化して保存されるため、この場で控えないと二度と表示できない。
+ * Bulk-registers employees and issues initial PINs.
+ * Edit the list below before running; distribute the PINs shown in the log to each person.
+ * PINs are stored hashed, so they can never be shown again after this — record them now.
  */
 function addEmployees() {
   const list = [
-    { code: 'E001', name: '山田 太郎', email: '' },
-    { code: 'E002', name: '鈴木 花子', email: '' }
+    { code: 'E001', name: 'John Smith', email: '' },
+    { code: 'E002', name: 'Jane Doe', email: '' }
   ];
 
   const out = [];
 
   list.forEach(p => {
     if (findEmployee(p.code)) {
-      out.push(p.code + ' : 既に登録済み（スキップ）');
+      out.push(p.code + ' : already registered (skipped)');
       return;
     }
-    const pin  = String(Math.floor(100000 + Math.random() * 900000)); // 6桁
+    const pin  = String(Math.floor(100000 + Math.random() * 900000)); // 6 digits
     const salt = Utilities.getUuid();
     appendRowByHeader(SHEETS.EMPLOYEES, {
       employee_code: p.code.toUpperCase(), name: p.name, email: p.email || '',
@@ -710,29 +747,29 @@ function addEmployees() {
     out.push(p.code + ' / ' + p.name + ' → PIN: ' + pin);
   });
 
-  Logger.log('─── 発行結果（この画面を閉じると二度と見られません）───\n' + out.join('\n'));
+  Logger.log('─── Issued PINs (visible only now — this screen won\'t show them again) ───\n' + out.join('\n'));
 }
 
-/** PIN を再発行する。忘れた人が出たら実行する。 */
+/** Reissues a PIN. Run this when someone forgets theirs. */
 function resetPin() {
-  const code = 'E001';   // ← 対象の社員コードに書き換える
+  const code = 'E001';   // ← change to the target employee code
 
   const t = readTable(SHEETS.EMPLOYEES);
   const idx = t.rows.findIndex(e =>
     String(e.employee_code).trim().toUpperCase() === code.trim().toUpperCase());
-  if (idx < 0) return Logger.log('見つかりません: ' + code);
+  if (idx < 0) return Logger.log('Not found: ' + code);
 
   const pin  = String(Math.floor(100000 + Math.random() * 900000));
   const salt = Utilities.getUuid();
   t.sheet.getRange(idx + 2, t.col.pin_salt + 1).setValue(salt);
   t.sheet.getRange(idx + 2, t.col.pin_hash + 1).setValue(hashPin(pin, salt));
 
-  Logger.log(code + ' の新しい PIN: ' + pin);
+  Logger.log(code + ' new PIN: ' + pin);
 }
 
-/** 端末を失効させる。紛失・機種変更時に実行する。 */
+/** Deactivates a device. Run this when a device is lost or replaced. */
 function deactivateDevices() {
-  const code = 'E001';   // ← 対象の社員コードに書き換える
+  const code = 'E001';   // ← change to the target employee code
 
   const t = readTable(SHEETS.DEVICES);
   let n = 0;
@@ -743,19 +780,19 @@ function deactivateDevices() {
       n++;
     }
   });
-  Logger.log(code + ' の端末を ' + n + ' 件失効させました。本人に再登録を案内してください。');
+  Logger.log('Deactivated ' + n + ' device(s) for ' + code + '. Ask them to register again.');
 }
 
-/** 打刻を取り消す（物理削除はしない）。event_id を指定して実行する。 */
+/** Voids a punch (never physically deleted). Set event_id and run this. */
 function voidEvent() {
-  const eventId = '';          // ← event_id を貼る
-  const reason  = '打刻ミス';   // ← 理由
+  const eventId = '';          // ← paste the event_id here
+  const reason  = 'Punch mistake';   // ← reason
 
-  if (!eventId) return Logger.log('event_id を指定してください。');
+  if (!eventId) return Logger.log('Please specify an event_id.');
 
   const t = readTable(SHEETS.EVENTS);
   const idx = t.rows.findIndex(r => String(r.event_id) === eventId);
-  if (idx < 0) return Logger.log('見つかりません: ' + eventId);
+  if (idx < 0) return Logger.log('Not found: ' + eventId);
 
   t.sheet.getRange(idx + 2, t.col.is_voided + 1).setValue(true);
   appendRowByHeader(SHEETS.CORRECTIONS, {
@@ -770,41 +807,44 @@ function voidEvent() {
     approved_by: '',
     corrected_at: new Date()
   });
-  Logger.log('取り消しました: ' + eventId);
+  Logger.log('Voided: ' + eventId);
 }
 
 
 /* ════════════════════════════════════════════
-   8. 週次集計（月〜日）
+   8. Weekly summary (Mon–Sun)
    ════════════════════════════════════════════ */
 
 /**
- * 先週（月〜日）分の実働時間を社員ごとに合算し、weekly_summary に1行ずつ書き出す。
- * installWeeklyTrigger() で設定した時間主導トリガーから呼ばれる想定。
+ * Sums last week's (Mon–Sun) worked hours per employee and writes one row per
+ * employee to weekly_summary. Intended to be called by the time-driven
+ * trigger set up in installWeeklyTrigger().
  *
- * 集計の考え方 :
- *   punch_events の worked_hours / worked_minutes は「打刻するたびに、
- *   その時点でのその日の実働見込みを丸ごと上書きして記録したもの」なので、
- *   同じ日・同じ社員の行のうち一番最後（＝appendRow で一番下）の値が
- *   その日の確定値になる。それを月曜〜日曜ぶん集めて合計する。
+ * How the aggregation works:
+ *   Each punch_events row's worked_hours / worked_minutes is "the running
+ *   best estimate of that day's total, overwritten in full every time a
+ *   punch is made that day." So, for a given day and employee, the value on
+ *   the last row (i.e. the one appended last) is that day's final value.
+ *   Those final daily values are collected across Monday–Sunday and summed.
  */
 function buildWeeklySummary() {
   const today = businessDate(new Date());
   const thisMonday = mondayOfWeek(today);
-  const weekStart = addDays(thisMonday, -7); // 先週の月曜
-  const weekEnd = addDays(thisMonday, -1);   // 先週の日曜
+  const weekStart = addDays(thisMonday, -7); // last week's Monday
+  const weekEnd = addDays(thisMonday, -1);   // last week's Sunday
 
   const t = readHeader(SHEETS.EVENTS);
   const lastRow = t.sheet.getLastRow();
   if (lastRow < 2) {
-    Logger.log('punch_events にデータがありません。');
+    Logger.log('punch_events has no data.');
     return;
   }
 
   const values = t.sheet.getRange(2, 1, lastRow - 1, t.headers.length).getValues();
 
-  // 日付+社員をキーに、その日の最後の行の値で上書きしていく
-  // （appendRow は常に末尾追加＝時系列順なので、最後に残った値がその日の確定値になる）
+  // Overwrite by (date, employee) key with each matching row's value in sheet order
+  // (appendRow always appends at the end = chronological order, so whatever value
+  // survives is that day's final one).
   const perDay = {};
   values.forEach(r => {
     const bDate = normalizeDateStr(r[t.col.business_date]);
@@ -830,6 +870,10 @@ function buildWeeklySummary() {
     totals[code].minutes += d.minutes;
   });
 
+  // Remove any rows already written for this week before appending fresh ones,
+  // so a duplicate trigger firing or a manual re-run never doubles up the totals.
+  removeWeeklySummaryRows(weekStart);
+
   const now = new Date();
   const codes = Object.keys(totals);
   codes.forEach(code => {
@@ -844,13 +888,29 @@ function buildWeeklySummary() {
     });
   });
 
-  Logger.log(weekStart + '〜' + weekEnd + ' の週次集計を ' + codes.length + ' 名分 weekly_summary に書き出しました。');
+  Logger.log('Wrote the ' + weekStart + ' to ' + weekEnd + ' weekly summary for ' + codes.length + ' employee(s) to weekly_summary.');
+}
+
+/** Deletes any existing weekly_summary rows for the given week_start, so buildWeeklySummary() can be safely re-run. */
+function removeWeeklySummaryRows(weekStart) {
+  const t = readHeader(SHEETS.WEEKLY_SUMMARY);
+  const lastRow = t.sheet.getLastRow();
+  if (lastRow < 2) return;
+
+  const values = t.sheet.getRange(2, 1, lastRow - 1, t.headers.length).getValues();
+  // Delete from the bottom up so row indices stay valid as rows are removed.
+  for (let i = values.length - 1; i >= 0; i--) {
+    if (normalizeDateStr(values[i][t.col.week_start]) === weekStart) {
+      t.sheet.deleteRow(i + 2);
+    }
+  }
 }
 
 /**
- * 毎週月曜3時（CONFIG.TZ）に buildWeeklySummary() を自動実行するトリガーを設定する。
- * 初回に1回だけ実行する。既に同じトリガーがあれば削除してから作り直すので、
- * 何度実行しても二重登録にはならない。
+ * Sets up a trigger that automatically runs buildWeeklySummary() every
+ * Monday at 3am (CONFIG.TZ). Run this once, initially. Any existing trigger
+ * with the same handler is deleted first, so running this again never
+ * creates a duplicate.
  */
 function installWeeklyTrigger() {
   ScriptApp.getProjectTriggers().forEach(tr => {
@@ -864,5 +924,5 @@ function installWeeklyTrigger() {
     .inTimezone(CONFIG.TZ)
     .create();
 
-  Logger.log('毎週月曜 3時（' + CONFIG.TZ + '）に buildWeeklySummary() が自動実行されるよう設定しました。');
+  Logger.log('buildWeeklySummary() will now run automatically every Monday at 3am (' + CONFIG.TZ + ').');
 }

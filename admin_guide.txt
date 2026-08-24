@@ -1,0 +1,235 @@
+勤怠システム 管理者ガイド
+════════════════════════════════════════
+
+■ システム構成（3行で）
+・index.html … 社員がスマホで開く打刻画面（フロントエンド）
+・Code.gs … Google Apps Script（バックエンド）。index.html からのリクエストを受けて
+　　スプレッドシートを読み書きする
+・スプレッドシート「Attendance」… 全データの保存先（社員・端末・場所・所定時間・打刻記録など）
+
+
+════════════════════════════════════════
+1. 初回セットアップ手順（導入時に1回だけ）
+════════════════════════════════════════
+
+① Code.gs の CONFIG.SHEET_ID にスプレッドシートIDを入れる
+② Apps Script エディタで setup() を実行
+　　→ 必要なシートと見出し行が自動的に作られる
+③「デプロイ」→「新しいデプロイ」でウェブアプリとして公開
+　　実行するユーザー：自分 / アクセスできるユーザー：全員
+④ 発行された /exec の URL を index.html の CONFIG.API_URL に貼る
+⑤ addEmployees() を実行して社員を登録（PINが発行されるのでLogに出た値を本人に伝える）
+⑥ schedules シートに日付ごとの所定時間を入力
+⑦ locations シートに打刻場所を登録（type は FIXED か PORTABLE）
+⑧ installWeeklyTrigger() を実行（週次集計を自動化）
+
+以降、Code.gs を書き換えた時は必ず「デプロイを管理」→ 既存デプロイの編集 →
+「新バージョン」で再デプロイすること。これをしないと変更が反映されない。
+
+
+════════════════════════════════════════
+2. 日常運用でやること（早見表）
+════════════════════════════════════════
+
+やりたいこと                          対応方法
+─────────────────────────────────────────────
+新しい社員を追加したい          addEmployees() の list を書き換えて実行
+PINを忘れた社員がいる           resetPin() の code を書き換えて実行
+スマホを紛失/機種変更した       deactivateDevices() の code を書き換えて実行
+　　　　　　　　　　　　　      　→本人は次回リンクを開くと再登録画面になる
+打刻ミスを取り消したい          voidEvent() の eventId と reason を書き換えて実行
+新しい打刻場所を追加したい      locations シートに行を追加
+　　　　　　　　　　　　　      　（type=FIXED なら固定リンクに、
+　　　　　　　　　　　　　      　 PORTABLEなら持ち運びリンクにボタンが出る）
+日付ごとの所定時間を設定したい  schedules シートに行を追加
+　　　　　　　　　　　　　      　employee_code を空欄にすると全員共通になる
+週次集計を今すぐ見たい          buildWeeklySummary() を手動実行
+　　　　　　　　　　　　　      　（毎週月曜3時に自動でも実行される）
+
+
+════════════════════════════════════════
+3. Code.gs 関数リファレンス
+════════════════════════════════════════
+
+【A. 入り口となる関数（GASが自動的に呼ぶ）】
+
+doPost(e)
+　index.html からの全リクエストの入り口。action の値（register / state / punch）
+　に応じて下記のハンドラーに振り分ける。エラーはすべて logError() に記録される。
+
+doGet()
+　デプロイ確認用。ブラウザで /exec を開いた時に {"ok":true,...} が返るかを見る。
+
+json(obj)
+　レスポンスをJSON形式に変換する共通処理。
+
+
+【B. 打刻フローの処理関数（自動）】
+
+handleRegister(req)
+　端末登録（社員コード＋PINでログイン）。認証OKならトークンを devices シートに保存する。
+
+handleState(req)
+　打刻画面を開いた瞬間に呼ばれる。社員名、リンクの種別（Fixed/Portable）、
+　練習場所ボタンの一覧、次に押すべきボタンの候補（suggest）を返す。
+
+suggestNext(last)
+　直前の打刻が IN なら次は OUT、OUT なら次は IN……という「おすすめ」を計算する。
+　あくまで初期選択の目安で、社員が自由に変更できる。
+
+handlePunch(req)
+　打刻の本体処理。認証→リンク種別チェック→練習場所チェック→二重打刻防止→
+　位置情報チェック→実働時間の計算→punch_events シートへの記録、という流れ。
+　同時アクセスで行が壊れないよう LockService でロックしている。
+
+
+【C. 認証・データ検索（内部利用）】
+
+authenticate(token)
+　端末トークンが devices シートに存在し有効かを確認し、社員情報を返す。
+
+findEmployee(code)
+　employees シートから社員コードで検索する。
+
+validateMode(l)
+　URLの l パラメータが "FIXED" か "PORTABLE" のどちらかであることを確認する。
+　これ以外の値（廃止した個別リンクなど）は無効なリンクとして扱われる。
+
+findLocationByType(locId, type) / listLocationsByType(type)
+　locations シートから、リンクの種別（FIXED/PORTABLE）と一致する場所だけを
+　検索・一覧取得する。練習場所ボタンの元データ。
+
+
+【D. 勤務時間の計算（内部利用）】
+
+isValidSchedule(r)
+　schedules シートの1行が「開始時刻と時間数がちゃんと入っているか」を判定する。
+　空欄や不正な値の行は無視され、次の候補（全員共通の行→既定値）にフォールバックする。
+
+findSchedule(businessDateStr, employeeCode)
+　その日・その社員の所定時間を検索する。優先順位は
+　「個人別の行」→「employee_code が空欄の全員共通行」→「CONFIGの既定値(9:00開始・8時間)」。
+
+computeDayWorked(schedule, businessDateStr, events)
+　実働時間を計算する中心ロジック。
+　・Check In → Leave Early のペアはその区間の時間を積算
+　・Leave Early を押さずに Check In だけなら、所定終了時刻まで働いたとみなす
+　・出勤が遅れた分・早退した分は所定時間の枠内でしか計算されない
+　・1日の合計は所定時間数を超えない
+　・1日に複数回の出退勤（分割シフト）にも対応
+　時間(小数)と分(整数)の両方を返す。
+
+getTodayEvents(code, businessDateStr) / getLastPunchToday(code)
+　その社員のその日の打刻履歴を取得する。
+
+existsUuid(uuid)
+　オフライン再送で同じ打刻が二重に記録されないようにするための重複チェック。
+
+
+【E. シート操作の共通部品（内部利用・裏方）】
+
+sheet(name) / readHeader(name) / readTable(name)
+　シートの取得、見出し行から列名⇔列番号の対応表を作る、全行をオブジェクトの配列
+　として読み込む、という3段階の共通処理。列の並び順が変わっても壊れない設計。
+
+appendRowByHeader(name, valuesObj)
+　列名を指定して1行追記する。位置（何列目）ではなく列名で書き込むので、
+　将来シートに列を追加してもデータがズレない（過去に一度このズレでバグが発生したため導入）。
+
+truthy(v) / isNum(v)
+　チェックボックスの TRUE/FALSE や数値の判定を統一的に扱うための小さな補助関数。
+
+businessDate(d)
+　「勤務日」を計算する。DAY_BOUNDARY_HOUR（現在4時）より前の打刻は前日の勤務として扱う
+　（夜勤・日をまたぐ勤務のため）。
+
+addDays(dateStr, n) / mondayOfWeek(dateStr)
+　日付計算用。週次集計（月〜日の範囲）を求めるために使う。
+
+normalizeDateStr(v) / normalizeTimeStr(v)
+　スプレッドシートのセルが日付/時刻の実体（Date型）で来ても、文字列で来ても
+　同じ形式に揃えるための変換処理。
+
+haversine(lat1, lng1, lat2, lng2)
+　2点間の距離をメートルで計算する（GPS照合に使用）。
+
+reverseGeocode(lat, lng)
+　緯度経度から住所を取得する（PORTABLEリンクでの記録用）。失敗しても打刻は止めない。
+
+hashPin(pin, salt)
+　PINを平文で保存しないよう、ソルト＋ペッパー付きでハッシュ化する。
+
+logError(err)
+　予期しないエラーが起きた時に errors シートへ記録する。
+
+
+【F. 管理者がその都度手動で実行する関数】
+
+setup()
+　初回セットアップ用。必要なシート・見出し行・暗号化用の秘密情報（PEPPER）を作成する。
+　既存のデータは壊さない。何度実行しても安全。
+
+addEmployees()
+　社員を一括登録し、初期PINを発行する。実行前に list の中身を書き換える。
+　発行されたPINは実行ログにしか表示されないので、その場で控えて本人に伝えること。
+
+resetPin()
+　PINを忘れた社員のために再発行する。実行前に code を対象の社員コードに書き換える。
+
+deactivateDevices()
+　紛失・機種変更した端末を無効化する。実行前に code を書き換える。
+　無効化された端末は次回リンクを開くと再登録画面になる。
+
+voidEvent()
+　誤った打刻を取り消す（物理削除はせず、is_voided を TRUE にするだけ）。
+　実行前に eventId（punch_events シートのevent_id列の値）と reason を書き換える。
+　corrections シートに取り消し履歴が残る。
+
+buildWeeklySummary()
+　先週（月〜日）の実働時間を社員ごとに合計し、weekly_summary シートに書き出す。
+　毎週月曜3時に自動実行されるが、手動で今すぐ実行することもできる。
+　同じ週を再実行しても重複しないよう、書き込み前に既存行を削除する仕組みになっている。
+
+installWeeklyTrigger()
+　buildWeeklySummary() を毎週月曜3時に自動実行するトリガーを設定する。
+　初回に1回だけ実行すればよい（何度実行しても二重登録にはならない）。
+
+removeWeeklySummaryRows(weekStart)
+　buildWeeklySummary() が内部的に使う補助関数。指定した週の既存集計行を削除する。
+　単独で実行する必要はない。
+
+
+════════════════════════════════════════
+4. シート構成（列名）
+════════════════════════════════════════
+
+employees … employee_code, name, email, pin_salt, pin_hash, is_active
+devices … token, employee_code, registered_at, last_used_at, label, is_active
+locations … loc_id, name, type(FIXED/PORTABLE), lat, lng, radius_m, is_active
+schedules … business_date, employee_code(空欄=全員共通), scheduled_start, scheduled_hours, note
+punch_events … 打刻の生ログ。event_id, employee_code, employee_name, loc_id, loc_name,
+　punched_at, punch_type(IN/OUT), practice_loc_id, practice_loc_name, business_date,
+　lat, lng, accuracy_m, distance_m, geo_status, address, client_uuid, client_time,
+　user_agent, is_voided, worked_hours, worked_minutes
+weekly_summary … week_start, week_end, employee_code, employee_name,
+　worked_hours, worked_minutes, generated_at
+corrections … voidEvent() の取り消し履歴
+errors … 予期しないエラーのログ
+
+
+════════════════════════════════════════
+5. トラブルシューティング
+════════════════════════════════════════
+
+・「本日の実働」が空欄/おかしい
+　→ schedules シートのその日の行で scheduled_start か scheduled_hours が
+　　空欄・不正になっていないか確認する。
+
+・打刻してもスプレッドシートに反映されない
+　→ Code.gs を編集した後、再デプロイ（新バージョン）を忘れていないか確認する。
+
+・setup() 実行時に原因不明のエラーが出る
+　→ Apps Script エディタの「実行数」（時計アイコン）から実際のエラー内容を確認する。
+
+・不明なエラーが起きた場合
+　→ スプレッドシートの errors シートに詳細が記録されている。
