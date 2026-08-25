@@ -26,6 +26,10 @@
  *   7. Run installWeeklyTrigger() once
  *      → Every Monday at 3am, last week's (Mon–Sun) worked hours per
  *        employee are automatically summarized into weekly_summary
+ *   8. Set a password in setReportPassword() and run it once
+ *      → This password gates report.html, the admin-only page that builds
+ *        the attendance report (by location / employee / date range) and
+ *        writes it into the "report" sheet.
  *
  *  【Only 2 links are distributed to staff】
  *   Fixed locations : index.html?l=FIXED     (one shared link for all fixed sites)
@@ -34,6 +38,10 @@
  *   Either link then lets staff pick the actual place from the
  *   "Practice Location" buttons, sourced from locations rows matching
  *   that type.
+ *
+ *  【Admin-only report page】
+ *   report.html (also on GitHub Pages) — password-protected, builds a
+ *   pivot report (employees × dates) and writes it to the "report" sheet.
  * ══════════════════════════════════════════════════════════════
  */
 
@@ -92,9 +100,11 @@ function doPost(e) {
     const req = JSON.parse(e.postData.contents);
 
     switch (req.action) {
-      case 'register': return json(handleRegister(req));
-      case 'state':    return json(handleState(req));
-      case 'punch':    return json(handlePunch(req));
+      case 'register':    return json(handleRegister(req));
+      case 'state':       return json(handleState(req));
+      case 'punch':       return json(handlePunch(req));
+      case 'report_meta': return json(handleReportMeta(req));
+      case 'report':      return json(handleReport(req));
       default:
         return json({ ok: false, error: 'BAD_ACTION', message: 'Unknown action.' });
     }
@@ -956,4 +966,163 @@ function installWeeklyTrigger() {
     .create();
 
   Logger.log('buildWeeklySummary() will now run automatically every Monday at 3am (' + CONFIG.TZ + ').');
+}
+
+
+/* ════════════════════════════════════════════
+   9. Attendance report (admin, password-protected)
+   ════════════════════════════════════════════ */
+
+/**
+ * Sets (or changes) the password required to generate the attendance report
+ * from report.html. Anyone with this password can see every employee's
+ * hours, so treat it like any other shared admin credential.
+ * Edit the password below, then run this function once.
+ */
+function setReportPassword() {
+  const password = 'CHANGE_ME';   // ← set the report password here, then run this once
+
+  PropertiesService.getScriptProperties().setProperty('REPORT_PASSWORD', password);
+  Logger.log('Report password has been set.');
+}
+
+function checkReportPassword(pw) {
+  const expected = PropertiesService.getScriptProperties().getProperty('REPORT_PASSWORD') || '';
+  return !!expected && String(pw || '') === expected;
+}
+
+/**
+ * Returns the filter options (practice locations, employees) for the report
+ * screen's dropdowns. Requires the report password — this is the only data
+ * report.html can see before authenticating.
+ */
+function handleReportMeta(req) {
+  if (!checkReportPassword(req.password)) {
+    return { ok: false, error: 'BAD_PASSWORD', message: 'Incorrect password.' };
+  }
+
+  const locations = readTable(SHEETS.LOCATIONS).rows
+    .filter(r => truthy(r.is_active))
+    .map(r => ({ id: String(r.loc_id), label: String(r.name) + ' (' + String(r.type) + ')' }));
+
+  const employees = readTable(SHEETS.EMPLOYEES).rows
+    .filter(r => truthy(r.is_active))
+    .map(r => ({ code: String(r.employee_code), name: String(r.name) }));
+
+  return { ok: true, locations: locations, employees: employees };
+}
+
+/**
+ * Builds the attendance report for a date range (optionally filtered by
+ * practice location and/or employee) and writes it to the "report" sheet,
+ * overwriting whatever was there before.
+ *
+ * Layout: one row per employee, one column per date in the range, plus
+ * Total Hours / Scheduled Hours / Attendance Rate columns.
+ *   - Total Hours   : sum of that employee's worked_hours (from punch_events)
+ *                     across the dates in range that match the filters.
+ *   - Scheduled Hours: sum of findSchedule()'s scheduled_hours for every date
+ *                     in the range (via the same employee/location priority
+ *                     rules used for the live worked-hours calculation).
+ *                     Note: every date in the range is treated as an expected
+ *                     work day — this system has no explicit "day off" flag,
+ *                     so a range that includes non-working days will inflate
+ *                     the scheduled total and understate the attendance rate.
+ *   - Attendance Rate: Total Hours / Scheduled Hours, as a percentage.
+ */
+function handleReport(req) {
+  if (!checkReportPassword(req.password)) {
+    return { ok: false, error: 'BAD_PASSWORD', message: 'Incorrect password.' };
+  }
+
+  const startDate = String(req.start_date || '').trim();
+  const endDate = String(req.end_date || '').trim();
+  if (!startDate || !endDate || startDate > endDate) {
+    return { ok: false, error: 'BAD_RANGE', message: 'Please select a valid date range.' };
+  }
+
+  const dates = [];
+  for (let d = startDate; d <= endDate; d = addDays(d, 1)) {
+    dates.push(d);
+    if (dates.length > 366) {
+      return { ok: false, error: 'RANGE_TOO_LARGE', message: 'Please select a range of 366 days or fewer.' };
+    }
+  }
+
+  const locFilter = String(req.practice_loc_id || '').trim();       // '' = all locations
+  const empFilter = String(req.employee_code || '').trim().toUpperCase(); // '' = all employees
+
+  const t = readHeader(SHEETS.EVENTS);
+  const lastRow = t.sheet.getLastRow();
+
+  const perEmployeeDate = {}; // employee_code -> { business_date -> worked_hours }
+  const employeeNames = {};   // employee_code -> name
+
+  if (lastRow >= 2) {
+    const values = t.sheet.getRange(2, 1, lastRow - 1, t.headers.length).getValues();
+    values.forEach(r => {
+      if (truthy(r[t.col.is_voided])) return;
+
+      const bDate = normalizeDateStr(r[t.col.business_date]);
+      if (bDate < startDate || bDate > endDate) return;
+
+      const code = String(r[t.col.employee_code]).trim();
+      if (!code) return;
+      if (empFilter && code.toUpperCase() !== empFilter) return;
+      if (locFilter && String(r[t.col.practice_loc_id]).trim() !== locFilter) return;
+
+      employeeNames[code] = String(r[t.col.employee_name]);
+      if (!perEmployeeDate[code]) perEmployeeDate[code] = {};
+      // Rows are in chronological (append) order, so the last matching row
+      // for a given day is that day's final worked-hours value — same rule
+      // buildWeeklySummary() uses.
+      perEmployeeDate[code][bDate] = isNum(r[t.col.worked_hours]) ? Number(r[t.col.worked_hours]) : 0;
+    });
+  }
+
+  const employeeCodes = Object.keys(perEmployeeDate).sort();
+  if (!employeeCodes.length) {
+    return { ok: false, error: 'NO_DATA', message: 'No matching punches were found for this filter.' };
+  }
+
+  const headerRow = ['Employee'].concat(dates, ['Total Hours', 'Scheduled Hours', 'Attendance Rate']);
+  const dataRows = employeeCodes.map(code => {
+    let totalActual = 0;
+    let totalScheduled = 0;
+    const perDateCells = dates.map(d => {
+      const hrs = perEmployeeDate[code][d] || 0;
+      totalActual += hrs;
+      const sched = findSchedule(d, code, locFilter);
+      totalScheduled += (sched && isNum(sched.scheduled_hours)) ? Number(sched.scheduled_hours) : 0;
+      return hrs;
+    });
+    const rate = totalScheduled > 0 ? Math.round((totalActual / totalScheduled) * 1000) / 10 + '%' : '';
+    return [employeeNames[code] || code].concat(
+      perDateCells,
+      [Math.round(totalActual * 100) / 100, Math.round(totalScheduled * 100) / 100, rate]
+    );
+  });
+
+  const ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
+  let sh = ss.getSheetByName('report');
+  if (!sh) sh = ss.insertSheet('report');
+  sh.clear();
+
+  const title = 'Attendance Report — ' + (locFilter || 'All locations') + ' — ' +
+                (empFilter || 'All employees') + ' — ' + startDate + ' to ' + endDate +
+                ' (generated ' + Utilities.formatDate(new Date(), CONFIG.TZ, 'yyyy-MM-dd HH:mm') + ')';
+  sh.getRange(1, 1).setValue(title);
+  sh.getRange(2, 1, 1, headerRow.length).setValues([headerRow]);
+  sh.getRange(2, 1, 1, headerRow.length).setFontWeight('bold');
+  if (dataRows.length) {
+    sh.getRange(3, 1, dataRows.length, headerRow.length).setValues(dataRows);
+  }
+  sh.setFrozenRows(2);
+
+  return {
+    ok: true,
+    sheet_url: ss.getUrl() + '#gid=' + sh.getSheetId(),
+    employee_count: dataRows.length,
+    date_count: dates.length
+  };
 }
