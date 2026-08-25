@@ -223,11 +223,12 @@
 const CONFIG = {
   API_URL: 'https://script.google.com/macros/s/AKfycbzevhLv-1CXcH3yhRgHTt6v1vQ7opNhP1dEkQzmni_x6tAXnCOIbShW4pjd9Mjs882EBQ/exec',
   GEO_TIMEOUT_MS: 10000,
-  FETCH_TIMEOUT_MS: 15000
+  FETCH_TIMEOUT_MS: 25000
 };
 
 const TOKEN_KEY = 'punch.token';
 const QUEUE_KEY = 'punch.queue';
+const LOC_CACHE_KEY = 'punch.practiceLocations';
 
 /* ── Helpers ─────────────────────────── */
 const $ = id => document.getElementById(id);
@@ -353,7 +354,13 @@ function renderPracticeLocations(){
     b.onclick = () => selectPracticeLoc(loc.id);
     row.appendChild(b);
   });
+  // A location selected before this render (e.g. while the previous list was
+  // still showing) only counts if it still exists in the new list.
+  if (state.selectedPracticeLoc && !state.practiceLocations.some(loc => loc.id === state.selectedPracticeLoc)) {
+    state.selectedPracticeLoc = null;
+  }
   paintPracticeLocSelection();
+  updateSubmitEnabled();
 }
 function paintPracticeLocSelection(){
   $('practice-row').querySelectorAll('.btn-loc').forEach(b =>
@@ -384,6 +391,10 @@ async function openPunch(){
   state.selectedType = null;
   $('btn-in').classList.remove('selected');
   $('btn-out').classList.remove('selected');
+  // Clear any practice-location buttons left over from the previous screen
+  // immediately, so they can't be tapped (and desync the selection state)
+  // while this screen is still loading.
+  $('practice-row').innerHTML = '';
   updateSubmitEnabled();
 
   getPosition().then(g => { state.geo = g; paintGeo(g); });   // Fetched in parallel
@@ -392,10 +403,20 @@ async function openPunch(){
   try {
     r = await api({ action:'state', token: state.token, l: state.loc });
   } catch(e){
-    $('locName').textContent = 'Can’t Connect';
+    $('locName').textContent = 'Offline';
     setMsg($('punch-msg'),
-      'Couldn’t connect. If you check in/out now, it will be saved on this device and sent automatically once you’re back online.', 'warn');
+      'Couldn’t connect. You can still check in/out below — it will be saved on this device and sent automatically once you’re back online.', 'warn');
     $('who').textContent = 'Offline';
+    // No live location list available offline — fall back to the list from
+    // the last successful load, so offline check-in/out still works.
+    state.practiceLocations = JSON.parse(load(LOC_CACHE_KEY) || '[]');
+    renderPracticeLocations();
+    if (!state.practiceLocations.length){
+      setMsg($('punch-msg'),
+        'Couldn’t connect, and no practice locations are saved on this device yet. Please open this page once while online before using it offline.', 'err');
+    } else {
+      selectType('IN');
+    }
     return;
   }
 
@@ -418,6 +439,7 @@ async function openPunch(){
   $('who').textContent = r.name + (r.last ? ` · Last: ${r.last.type_label} at ${r.last.at_label}` : ' · No check-ins today yet');
 
   state.practiceLocations = r.practice_locations || [];
+  store(LOC_CACHE_KEY, JSON.stringify(state.practiceLocations));
   renderPracticeLocations();
 
   // Pre-select the recommended button (this does not submit; it can still be changed)
