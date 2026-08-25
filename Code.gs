@@ -12,7 +12,12 @@
  *        Who has access: Anyone
  *   4. Paste the issued /exec URL into CONFIG.API_URL in index.html
  *   5. Enter each date's scheduled hours (start time + hours) into the
- *      schedules sheet by hand
+ *      schedules sheet by hand. employee_code and practice_loc_id are both
+ *      optional — leave employee_code blank for "everyone" and
+ *      practice_loc_id blank for "any location". This lets different staff
+ *      working at the same location have different hours, and the same
+ *      employee have different hours depending on which location they
+ *      check in at. The most specific row (employee + location) wins.
  *   6. Register practice locations in the locations sheet (type is
  *      either FIXED or PORTABLE)
  *      → The "Practice Location" buttons on the punch screen are built
@@ -273,7 +278,7 @@ function handlePunch(req) {
     const now = new Date();
     const bDate = businessDate(now);
     const todaySoFar = getTodayEvents(emp.employee_code, bDate);
-    const schedule = findSchedule(bDate, emp.employee_code);
+    const schedule = findSchedule(bDate, emp.employee_code, practiceLoc.loc_id);
     const worked = computeDayWorked(
       schedule, bDate, todaySoFar.concat([{ type: type, punched_at: now }]));
 
@@ -397,27 +402,53 @@ function isValidSchedule(r) {
 }
 
 /**
- * Finds the scheduled hours for a given day and employee.
- * A personal row takes priority; otherwise the "everyone" row (blank employee_code) is used.
- * Rows with a blank/invalid start time or hours are skipped in favor of the next candidate.
- * If none are found, falls back to the CONFIG default (a safety net).
+ * Finds the scheduled hours for a given day, employee, and practice location.
+ * employee_code and practice_loc_id are both optional in the schedules sheet —
+ * a blank employee_code means "everyone", and a blank practice_loc_id means
+ * "any location". Different staff at the same location on the same day can
+ * therefore have different scheduled hours (per-employee rows), and the same
+ * employee can have different hours depending on which location they're
+ * checking in at (per-location rows).
+ *
+ * The most specific match wins, in this order:
+ *   1. this employee + this location
+ *   2. this employee + any location
+ *   3. any employee   + this location
+ *   4. any employee   + any location (fully blanket row)
+ * Rows with a blank/invalid start time or hours are skipped in favor of the
+ * next candidate. If nothing matches, falls back to the CONFIG default
+ * (a safety net).
  */
-function findSchedule(businessDateStr, employeeCode) {
+function findSchedule(businessDateStr, employeeCode, practiceLocId) {
   const t = readTable(SHEETS.SCHEDULES);
-  let personal = null;
-  let blanket = null;
+  const code = String(employeeCode || '').trim().toUpperCase();
+  const loc = String(practiceLocId || '').trim().toUpperCase();
+
+  let best = null;
+  let bestScore = -1;
+
   for (const r of t.rows) {
     if (normalizeDateStr(r.business_date) !== businessDateStr) continue;
     if (!isValidSchedule(r)) continue;
-    const code = String(r.employee_code || '').trim().toUpperCase();
-    if (code === String(employeeCode).trim().toUpperCase()) personal = r;
-    else if (!code) blanket = r;
+
+    const rowCode = String(r.employee_code || '').trim().toUpperCase();
+    if (rowCode && rowCode !== code) continue; // row is for a different specific employee
+
+    const rowLoc = String(r.practice_loc_id || '').trim().toUpperCase();
+    if (rowLoc && rowLoc !== loc) continue; // row is for a different specific location
+
+    const score = (rowCode ? 2 : 0) + (rowLoc ? 1 : 0);
+    if (score >= bestScore) { // later rows win ties, so a correction row added below an old one takes over
+      bestScore = score;
+      best = r;
+    }
   }
-  if (personal) return personal;
-  if (blanket) return blanket;
+
+  if (best) return best;
   return {
     business_date: businessDateStr,
     employee_code: '',
+    practice_loc_id: '',
     scheduled_start: CONFIG.DEFAULT_SCHEDULED_START,
     scheduled_hours: CONFIG.DEFAULT_SCHEDULED_HOURS
   };
@@ -676,7 +707,7 @@ function setup() {
                          'worked_hours', 'worked_minutes'],
     [SHEETS.CORRECTIONS]: ['correction_id', 'original_event_id', 'employee_code', 'field',
                            'old_value', 'new_value', 'reason', 'requested_by', 'approved_by', 'corrected_at'],
-    [SHEETS.SCHEDULES]: ['business_date', 'employee_code', 'scheduled_start', 'scheduled_hours', 'note'],
+    [SHEETS.SCHEDULES]: ['business_date', 'employee_code', 'practice_loc_id', 'scheduled_start', 'scheduled_hours', 'note'],
     [SHEETS.WEEKLY_SUMMARY]: ['week_start', 'week_end', 'employee_code', 'employee_name',
                               'worked_hours', 'worked_minutes', 'generated_at'],
     'errors': ['at', 'message', 'stack']
