@@ -805,8 +805,8 @@ function addEmployees() {
     { code: 'E005', name: 'Vincent', email: '' },
     { code: 'E006', name: 'Kai Yang', email: '' },
     { code: 'E007', name: 'Shizuki', email: '' },
-    { code: 'E008', name: 'Yusuke', email: '' },
-    { code: 'E009', name: 'Suzuku', email: '' },
+    { code: 'E008', name: 'Suzuku', email: '' },
+    { code: 'E009', name: 'Yusuke', email: '' },
     { code: 'A001', name: 'Ken', email: '' },
     { code: 'A002', name: 'Zhi Zhi', email: '' },
     { code: 'A003', name: 'Al', email: '' },
@@ -1135,7 +1135,9 @@ function handleReportMeta(req) {
  * employee_prefixes; if both arrays are empty, every employee is included.
  *
  * Layout: one row per employee, one column per date in the range, plus
- * Total Hours / Scheduled Hours / Attendance Rate columns.
+ * Total Hours / Attendance Rate columns. Every date column and Total Hours
+ * are formatted to always show 2 decimal places (e.g. "3.00"), since that's
+ * precise enough to distinguish individual minutes.
  *   - Total Hours   : for each day the employee is included (see below),
  *                     recomputeDayWorked() recalculates that day's hours
  *                     from the raw punch_events rows and whatever is
@@ -1148,14 +1150,16 @@ function handleReportMeta(req) {
  *                     once included, ALL of that day's punches (at any
  *                     location) feed into the hours calculation, matching
  *                     how a single day's total has always been computed.
- *   - Scheduled Hours: sum of findSchedule()'s scheduled_hours for every date
- *                     in the range (via the same employee/location priority
- *                     rules used for the live worked-hours calculation).
+ *   - Attendance Rate: Total Hours divided by the employee's scheduled hours
+ *                     (summed via findSchedule() for every date in the
+ *                     range, using the same employee/location priority
+ *                     rules as the live worked-hours calculation), as a
+ *                     percentage. The scheduled-hours total itself isn't
+ *                     shown as a column, only this derived rate.
  *                     Note: every date in the range is treated as an expected
  *                     work day — this system has no explicit "day off" flag,
  *                     so a range that includes non-working days will inflate
  *                     the scheduled total and understate the attendance rate.
- *   - Attendance Rate: Total Hours / Scheduled Hours, as a percentage.
  */
 function handleReport(req) {
   if (!checkReportPassword(req.password)) {
@@ -1247,7 +1251,10 @@ function handleReport(req) {
     return { ok: false, error: 'NO_DATA', message: 'No matching punches were found for this filter.' };
   }
 
-  const headerRow = ['Employee'].concat(dates, ['Total Hours', 'Scheduled Hours', 'Attendance Rate']);
+  // Scheduled Hours itself isn't shown in the report — only Total Hours and the
+  // Attendance Rate derived from it — but it's still computed internally since
+  // the rate needs it as a denominator.
+  const headerRow = ['Employee'].concat(dates, ['Total Hours', 'Attendance Rate']);
   const dataRows = employeeCodes.map(code => {
     let totalActual = 0;
     let totalScheduled = 0;
@@ -1261,7 +1268,7 @@ function handleReport(req) {
     const rate = totalScheduled > 0 ? Math.round((totalActual / totalScheduled) * 1000) / 10 + '%' : '';
     return [employeeNames[code] || code].concat(
       perDateCells,
-      [Math.round(totalActual * 100) / 100, Math.round(totalScheduled * 100) / 100, rate]
+      [Math.round(totalActual * 100) / 100, rate]
     );
   });
 
@@ -1283,6 +1290,11 @@ function handleReport(req) {
   sh.getRange(2, 1, 1, headerRow.length).setFontWeight('bold');
   if (dataRows.length) {
     sh.getRange(3, 1, dataRows.length, headerRow.length).setValues(dataRows);
+    // Force every date column plus Total Hours to always show 2 decimal
+    // places (e.g. "3.00" instead of "3"), so partial-hour/minute detail
+    // is visible even for whole-hour totals.
+    const hourColumns = dates.length + 1; // each date column + Total Hours
+    sh.getRange(3, 2, dataRows.length, hourColumns).setNumberFormat('0.00');
   }
   sh.setFrozenRows(2);
 
