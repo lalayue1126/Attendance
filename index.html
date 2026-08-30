@@ -436,7 +436,8 @@ async function openPunch(){
   }
 
   $('locName').textContent = r.loc_mode_label || state.loc;
-  $('who').textContent = r.name + (r.last ? ` · Last: ${r.last.type_label} at ${r.last.at_label}` : ' · No check-ins today yet');
+  const whoName = r.employee_code ? `${r.name} (${r.employee_code})` : r.name;
+  $('who').textContent = whoName + (r.last ? ` · Last: ${r.last.type_label} at ${r.last.at_label}` : ' · No check-ins today yet');
 
   state.practiceLocations = r.practice_locations || [];
   store(LOC_CACHE_KEY, JSON.stringify(state.practiceLocations));

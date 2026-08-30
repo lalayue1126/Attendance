@@ -1,0 +1,76 @@
+E001	Kan
+E002	Kenta
+E003	Rio
+E004	Issei
+E005	Vincent
+E006	Kai Yang
+E007	Shizuki
+E008	Yusuke
+E009	Suzuku
+A001	Ken
+A002	Zhi Zhi
+A003	Al
+A004	CK
+A005	Darren
+A006	Wai Chun
+A007	Dominic
+A008	NIcholas
+A009	Sanjiv
+A010	Wen Zhe
+A011	Derek
+A012	Shaunn
+A013	Isaac
+A014	Ivaac
+A015	Matthias
+A016	Justin
+A017	Gaberiel
+A018	Yong Jun
+A019	Javier
+A020	Zahar
+N001	Cayden
+N002	Joshua
+N003	Hong Kai
+N004	Jonathan
+N005	Abriel
+N006	Maximus
+N007	Mikel
+S001	Adrian
+Y001	Merrill
+Y002	Jon-Wy
+Y003	Kaien
+Y004	Rhys
+Y005	Qays
+Y006	Jalen
+Y007	Ethan
+Y008	Gerald
+Y009	Kae Mann
+Y010	Ruiye
+Y011	Nathan
+Y012	Dylan
+Y013	Evan
+Y014	Zaiver
+Y015	Gabriel
+Y016	Skyler
+Y017	Asher Poon
+Y018	Tristan
+Y019	Alden
+Y020	Ryan
+Y021	Zachary
+Y022	Russell
+Y023	Elijah
+Y024	Jordan
+Y025	Darius
+Y026	Lucas
+Y027	Clarence
+Y028	Ayden
+Y029	Joshua
+Y030	Jarrod
+Y031	Z-Hean
+Y032	Savva
+Y033	Bransten
+Y034	Jayven
+Y035	Asher Sim
+Y036	Raphael
+Y037	Lennon
+Y038	Jeroy
+Y039	Kaysan

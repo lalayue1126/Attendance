@@ -55,6 +55,13 @@
   .row{display:flex;gap:10px}
   .row .field{flex:1 1 0}
 
+  .emp-group{border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:10px}
+  .emp-group-head{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+  .emp-group-head input[type=checkbox]{width:auto;accent-color:var(--ink)}
+  .emp-group-head label{margin:0;font-size:14px}
+  .emp-group select[multiple]{height:auto;min-height:72px}
+  .emp-group select[multiple]:disabled{opacity:.5}
+
   button{
     font-family:inherit;font-size:16px;font-weight:600;
     border-radius:10px;border:1px solid transparent;
@@ -106,10 +113,14 @@
     </div>
 
     <div class="field">
-      <label for="f-employee">Employee</label>
-      <select id="f-employee">
-        <option value="">All employees</option>
-      </select>
+      <label>Employees</label>
+      <p class="note" style="margin:0 0 8px">
+        Leave everything below unchecked/unselected for all employees.
+        Check a letter to include everyone whose code starts with it, and/or
+        pick specific people from that letter's list (Ctrl/Cmd-click,
+        or tap each name on mobile, to select more than one).
+      </p>
+      <div id="employee-groups"></div>
     </div>
 
     <div class="row">
@@ -196,7 +207,7 @@ async function unlock(){
     }
     state.password = pw;
     populateSelect('f-location', r.locations, l => [l.id, l.label], true);
-    populateSelect('f-employee', r.employees, e => [e.code, e.name], true);
+    renderEmployeeGroups(r.employees);
 
     const today = new Date();
     const p = n => String(n).padStart(2,'0');
@@ -226,6 +237,83 @@ function populateSelect(id, items, mapFn, keepFirst){
   });
 }
 
+/* ── Employee groups: one per first letter of employee_code (E/N/Y/S/…),
+   each with a "select all in this group" checkbox plus a multi-select of
+   individual names. Groups are built from whatever letters are actually
+   in use, so an unexpected prefix still gets its own group instead of
+   being hidden. ── */
+const KNOWN_PREFIXES = ['E', 'A', 'N', 'S', 'Y'];
+
+function renderEmployeeGroups(employees){
+  const groups = {}; // letter -> [{code,name}]
+  employees.forEach(e => {
+    const letter = /^[A-Za-z]/.test(e.code) ? e.code.charAt(0).toUpperCase() : 'Other';
+    (groups[letter] = groups[letter] || []).push(e);
+  });
+
+  const letters = Object.keys(groups).sort((a, b) => {
+    const ka = KNOWN_PREFIXES.indexOf(a), kb = KNOWN_PREFIXES.indexOf(b);
+    if (ka === -1 && kb === -1) return a.localeCompare(b);
+    if (ka === -1) return 1;   // unknown/"Other" letters sort after the known ones
+    if (kb === -1) return -1;
+    return ka - kb;
+  });
+
+  const container = $('employee-groups');
+  container.innerHTML = '';
+
+  letters.forEach(letter => {
+    const box = document.createElement('div');
+    box.className = 'emp-group';
+
+    const head = document.createElement('div');
+    head.className = 'emp-group-head';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.id = 'grp-all-' + letter;
+    cb.dataset.prefix = letter;
+    const cbLabel = document.createElement('label');
+    cbLabel.htmlFor = cb.id;
+    cbLabel.textContent = `Select all ${letter} (${groups[letter].length})`;
+    head.appendChild(cb);
+    head.appendChild(cbLabel);
+
+    const sel = document.createElement('select');
+    sel.multiple = true;
+    sel.dataset.prefix = letter;
+    groups[letter]
+      .sort((a, b) => a.code.localeCompare(b.code))
+      .forEach(e => {
+        const opt = document.createElement('option');
+        opt.value = e.code;
+        opt.textContent = `${e.name} (${e.code})`;
+        sel.appendChild(opt);
+      });
+
+    // Checking "select all" for a letter covers everyone with that prefix
+    // (including future employees), so the individual picker underneath
+    // becomes redundant — disable and clear it to avoid a confusing
+    // double-signal.
+    cb.addEventListener('change', () => {
+      sel.disabled = cb.checked;
+      if (cb.checked) Array.from(sel.options).forEach(o => o.selected = false);
+    });
+
+    box.appendChild(head);
+    box.appendChild(sel);
+    container.appendChild(box);
+  });
+}
+
+function collectEmployeeSelection(){
+  const prefixes = Array.from(document.querySelectorAll('#employee-groups input[type=checkbox]:checked'))
+    .map(cb => cb.dataset.prefix);
+  const codes = Array.from(document.querySelectorAll('#employee-groups select'))
+    .filter(sel => !sel.disabled)
+    .flatMap(sel => Array.from(sel.selectedOptions).map(o => o.value));
+  return { prefixes, codes };
+}
+
 /* ── Step 2: generate ───────────────────── */
 async function generate(){
   const start = $('f-start').value;
@@ -237,12 +325,15 @@ async function generate(){
   btn.disabled = true; btn.textContent = 'Generating…';
   setMsg($('form-msg'), '');
 
+  const emp = collectEmployeeSelection();
+
   try {
     const r = await api({
       action: 'report',
       password: state.password,
       practice_loc_id: $('f-location').value,
-      employee_code: $('f-employee').value,
+      employee_codes: emp.codes,
+      employee_prefixes: emp.prefixes,
       start_date: start,
       end_date: end
     });

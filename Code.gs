@@ -187,6 +187,7 @@ function handleState(req) {
   return {
     ok: true,
     name: emp.name,
+    employee_code: emp.employee_code,
     loc_mode: mode,
     loc_mode_label: MODE_LABEL[mode],
     suggest: suggestNext(last),
@@ -514,6 +515,35 @@ function computeDayWorked(schedule, businessDateStr, events) {
 }
 
 /**
+ * Recomputes one employee's worked hours for one business date from that
+ * day's raw punch_events rows, using whatever is CURRENTLY in the schedules
+ * sheet. This is the single source of truth used by both buildWeeklySummary()
+ * and handleReport() — neither one trusts the worked_hours/worked_minutes
+ * columns already sitting in punch_events, so correcting a schedule after
+ * the fact (a last-minute change entered once practice is over) is picked
+ * up automatically the next time either is (re-)generated, with no separate
+ * recompute step.
+ *
+ * dayEvents must contain every non-voided event for this employee on this
+ * date, regardless of practice location — all of them are needed to pair
+ * Check In / Leave Early correctly. The schedule is looked up against the
+ * *last* event's practice location, matching how handlePunch() decides it
+ * live (each punch recomputes the whole day using its own location, so
+ * whichever punch was most recent is what determines the day's total).
+ */
+function recomputeDayWorked(employeeCode, businessDateStr, dayEvents) {
+  if (!dayEvents.length) return { hours: 0, minutes: 0 };
+  const sorted = dayEvents.slice().sort((a, b) => a.punched_at - b.punched_at);
+  const lastLoc = sorted[sorted.length - 1].practice_loc_id;
+  const schedule = findSchedule(businessDateStr, employeeCode, lastLoc);
+  const worked = computeDayWorked(schedule, businessDateStr, sorted);
+  return {
+    hours: isNum(worked.hours) ? worked.hours : 0,
+    minutes: isNum(worked.minutes) ? worked.minutes : 0
+  };
+}
+
+/**
  * Returns all of this employee's punches for today, oldest first.
  * Scans backward from the end of the sheet, so performance doesn't
  * degrade as the row count grows.
@@ -768,8 +798,82 @@ function setup() {
  */
 function addEmployees() {
   const list = [
-    { code: 'E001', name: 'John Smith', email: '' },
-    { code: 'E002', name: 'Jane Doe', email: '' }
+    { code: 'E001', name: 'Kan', email: '' },
+    { code: 'E002', name: 'Kenta', email: '' },
+    { code: 'E003', name: 'Rio', email: '' },
+    { code: 'E004', name: 'Issei', email: '' },
+    { code: 'E005', name: 'Vincent', email: '' },
+    { code: 'E006', name: 'Kai Yang', email: '' },
+    { code: 'E007', name: 'Shizuki', email: '' },
+    { code: 'E008', name: 'Yusuke', email: '' },
+    { code: 'E009', name: 'Suzuku', email: '' },
+    { code: 'A001', name: 'Ken', email: '' },
+    { code: 'A002', name: 'Zhi Zhi', email: '' },
+    { code: 'A003', name: 'Al', email: '' },
+    { code: 'A004', name: 'CK', email: '' },
+    { code: 'A005', name: 'Darren', email: '' },
+    { code: 'A006', name: 'Wai Chun', email: '' },
+    { code: 'A007', name: 'Dominic', email: '' },
+    { code: 'A008', name: 'Nicholas', email: '' },
+    { code: 'A009', name: 'Sanjiv', email: '' },
+    { code: 'A010', name: 'Wen Zhe', email: '' },
+    { code: 'A011', name: 'Derek', email: '' },
+    { code: 'A012', name: 'Shaunn', email: '' },
+    { code: 'A013', name: 'Isaac', email: '' },
+    { code: 'A014', name: 'Ivaac', email: '' },
+    { code: 'A015', name: 'Matthias', email: '' },
+    { code: 'A016', name: 'Justin', email: '' },
+    { code: 'A017', name: 'Gabriel Low', email: '' },
+    { code: 'A018', name: 'Yong Jun', email: '' },
+    { code: 'A019', name: 'Javier', email: '' },
+    { code: 'A020', name: 'Zahar', email: '' },
+    { code: 'N001', name: 'Cayden', email: '' },
+    { code: 'N002', name: 'Joshua', email: '' },
+    { code: 'N003', name: 'Hong Kai', email: '' },
+    { code: 'N004', name: 'Jonathan', email: '' },
+    { code: 'N005', name: 'Abriel', email: '' },
+    { code: 'N006', name: 'Maximus', email: '' },
+    { code: 'N007', name: 'Mikel', email: '' },
+    { code: 'S001', name: 'Adrian', email: '' },
+    { code: 'Y001', name: 'Merrill', email: '' },
+    { code: 'Y002', name: 'Jon-Wy', email: '' },
+    { code: 'Y003', name: 'Kaien', email: '' },
+    { code: 'Y004', name: 'Rhys', email: '' },
+    { code: 'Y005', name: 'Qays', email: '' },
+    { code: 'Y006', name: 'Jalen', email: '' },
+    { code: 'Y007', name: 'Ethan', email: '' },
+    { code: 'Y008', name: 'Gerald', email: '' },
+    { code: 'Y009', name: 'Kae Mann', email: '' },
+    { code: 'Y010', name: 'Ruiye', email: '' },
+    { code: 'Y011', name: 'Nathan', email: '' },
+    { code: 'Y012', name: 'Dylan', email: '' },
+    { code: 'Y013', name: 'Evan', email: '' },
+    { code: 'Y014', name: 'Zaiver', email: '' },
+    { code: 'Y015', name: 'Gabriel', email: '' },
+    { code: 'Y016', name: 'Skyler', email: '' },
+    { code: 'Y017', name: 'Asher Poon', email: '' },
+    { code: 'Y018', name: 'Tristan', email: '' },
+    { code: 'Y019', name: 'Alden', email: '' },
+    { code: 'Y020', name: 'Ryan', email: '' },
+    { code: 'Y021', name: 'Zachary', email: '' },
+    { code: 'Y022', name: 'Russell', email: '' },
+    { code: 'Y023', name: 'Elijah', email: '' },
+    { code: 'Y024', name: 'Jordan', email: '' },
+    { code: 'Y025', name: 'Darius', email: '' },
+    { code: 'Y026', name: 'Lucas', email: '' },
+    { code: 'Y027', name: 'Clarence', email: '' },
+    { code: 'Y028', name: 'Ayden', email: '' },
+    { code: 'Y029', name: 'Joshua', email: '' },
+    { code: 'Y030', name: 'Jarrod', email: '' },
+    { code: 'Y031', name: 'Z-Hean', email: '' },
+    { code: 'Y032', name: 'Savva', email: '' },
+    { code: 'Y033', name: 'Bransten', email: '' },
+    { code: 'Y034', name: 'Jayven', email: '' },
+    { code: 'Y035', name: 'Asher Sim', email: '' },
+    { code: 'Y036', name: 'Raphael', email: '' },
+    { code: 'Y037', name: 'Lennon', email: '' },
+    { code: 'Y038', name: 'Jeroy', email: '' },
+    { code: 'Y039', name: 'Kaysan', email: '' }
   ];
 
   const out = [];
@@ -862,11 +966,14 @@ function voidEvent() {
  * trigger set up in installWeeklyTrigger().
  *
  * How the aggregation works:
- *   Each punch_events row's worked_hours / worked_minutes is "the running
- *   best estimate of that day's total, overwritten in full every time a
- *   punch is made that day." So, for a given day and employee, the value on
- *   the last row (i.e. the one appended last) is that day's final value.
- *   Those final daily values are collected across Monday–Sunday and summed.
+ *   Every non-voided punch_events row in range is grouped by (date, employee)
+ *   into its raw events (type + time + location), then recomputeDayWorked()
+ *   recalculates that day's hours from scratch against whatever is currently
+ *   in the schedules sheet. Nothing here trusts the worked_hours /
+ *   worked_minutes columns already sitting in punch_events, so a schedule
+ *   correction made after the fact is reflected automatically the next time
+ *   this runs — just re-run it (safe: existing rows for the week are
+ *   replaced, never duplicated).
  */
 function buildWeeklySummary() {
   const today = businessDate(new Date());
@@ -883,32 +990,37 @@ function buildWeeklySummary() {
 
   const values = t.sheet.getRange(2, 1, lastRow - 1, t.headers.length).getValues();
 
-  // Overwrite by (date, employee) key with each matching row's value in sheet order
-  // (appendRow always appends at the end = chronological order, so whatever value
-  // survives is that day's final one).
-  const perDay = {};
+  // Group raw events by (date, employee) so each day's hours can be
+  // recomputed live from the current schedules sheet.
+  const eventsByDayEmployee = {}; // 'date|code' -> [{type, punched_at, practice_loc_id}]
+  const employeeNames = {};       // employee_code -> name
+
   values.forEach(r => {
+    if (truthy(r[t.col.is_voided])) return;
     const bDate = normalizeDateStr(r[t.col.business_date]);
     if (bDate < weekStart || bDate > weekEnd) return;
-    if (truthy(r[t.col.is_voided])) return;
 
     const code = String(r[t.col.employee_code]).trim();
     if (!code) return;
 
-    perDay[bDate + '|' + code] = {
-      name: String(r[t.col.employee_name]),
-      hours: isNum(r[t.col.worked_hours]) ? Number(r[t.col.worked_hours]) : 0,
-      minutes: isNum(r[t.col.worked_minutes]) ? Number(r[t.col.worked_minutes]) : 0
-    };
+    employeeNames[code] = String(r[t.col.employee_name]);
+    const key = bDate + '|' + code;
+    (eventsByDayEmployee[key] = eventsByDayEmployee[key] || []).push({
+      type: String(r[t.col.punch_type]),
+      punched_at: new Date(r[t.col.punched_at]),
+      practice_loc_id: String(r[t.col.practice_loc_id] || '')
+    });
   });
 
   const totals = {};
-  Object.keys(perDay).forEach(key => {
-    const code = key.split('|')[1];
-    const d = perDay[key];
-    if (!totals[code]) totals[code] = { name: d.name, hours: 0, minutes: 0 };
-    totals[code].hours += d.hours;
-    totals[code].minutes += d.minutes;
+  Object.keys(eventsByDayEmployee).forEach(key => {
+    const sep = key.indexOf('|');
+    const bDate = key.slice(0, sep);
+    const code = key.slice(sep + 1);
+    const worked = recomputeDayWorked(code, bDate, eventsByDayEmployee[key]);
+    if (!totals[code]) totals[code] = { name: employeeNames[code], hours: 0, minutes: 0 };
+    totals[code].hours += worked.hours;
+    totals[code].minutes += worked.minutes;
   });
 
   // Remove any rows already written for this week before appending fresh ones,
@@ -1013,14 +1125,29 @@ function handleReportMeta(req) {
 }
 
 /**
- * Builds the attendance report for a date range (optionally filtered by
- * practice location and/or employee) and writes it to the "report" sheet,
- * overwriting whatever was there before.
+ * Builds the attendance report for a date range and writes it to the
+ * "report" sheet, overwriting whatever was there before. Filters:
+ *   - practice_loc_id   : single location id, or '' for all locations.
+ *   - employee_codes    : array of specific employee codes to include.
+ *   - employee_prefixes : array of single letters (e.g. 'E'); every employee
+ *                         whose code starts with one of them is included.
+ * A row matches if it's in employee_codes OR its prefix is in
+ * employee_prefixes; if both arrays are empty, every employee is included.
  *
  * Layout: one row per employee, one column per date in the range, plus
  * Total Hours / Scheduled Hours / Attendance Rate columns.
- *   - Total Hours   : sum of that employee's worked_hours (from punch_events)
- *                     across the dates in range that match the filters.
+ *   - Total Hours   : for each day the employee is included (see below),
+ *                     recomputeDayWorked() recalculates that day's hours
+ *                     from the raw punch_events rows and whatever is
+ *                     CURRENTLY in the schedules sheet — never the
+ *                     worked_hours snapshot stored on the row itself — so a
+ *                     schedule correction made after the fact is reflected
+ *                     the next time the report is generated. A day counts
+ *                     as included if the employee has at least one non-voided
+ *                     punch that day matching the location filter (if any);
+ *                     once included, ALL of that day's punches (at any
+ *                     location) feed into the hours calculation, matching
+ *                     how a single day's total has always been computed.
  *   - Scheduled Hours: sum of findSchedule()'s scheduled_hours for every date
  *                     in the range (via the same employee/location priority
  *                     rules used for the live worked-hours calculation).
@@ -1050,13 +1177,34 @@ function handleReport(req) {
   }
 
   const locFilter = String(req.practice_loc_id || '').trim();       // '' = all locations
-  const empFilter = String(req.employee_code || '').trim().toUpperCase(); // '' = all employees
+
+  // Employees can be picked individually (employee_codes) and/or by the
+  // first letter of their code (employee_prefixes, e.g. 'E' for E001/E002/...).
+  // A row matches if either list includes it; if both lists are empty, every
+  // employee matches (the "all employees" default).
+  const empCodesFilter = (Array.isArray(req.employee_codes) ? req.employee_codes : [])
+    .map(c => String(c).trim().toUpperCase()).filter(Boolean);
+  const empPrefixFilter = (Array.isArray(req.employee_prefixes) ? req.employee_prefixes : [])
+    .map(c => String(c).trim().toUpperCase()).filter(Boolean);
+  const hasEmpFilter = empCodesFilter.length > 0 || empPrefixFilter.length > 0;
+
+  function employeeMatches(code) {
+    if (!hasEmpFilter) return true;
+    const upper = code.toUpperCase();
+    return empCodesFilter.indexOf(upper) !== -1 || empPrefixFilter.indexOf(upper.charAt(0)) !== -1;
+  }
 
   const t = readHeader(SHEETS.EVENTS);
   const lastRow = t.sheet.getLastRow();
 
-  const perEmployeeDate = {}; // employee_code -> { business_date -> worked_hours }
-  const employeeNames = {};   // employee_code -> name
+  // Pass 1: collect every non-voided event in range, grouped by (date, employee),
+  // regardless of the location filter — pairing Check In / Leave Early correctly
+  // requires seeing the whole day. Separately, mark which (date, employee) keys
+  // actually match the filters ("included") so the location filter only decides
+  // which days show up in the report, not which of that day's punches count.
+  const eventsByDayEmployee = {}; // 'date|code' -> [{type, punched_at, practice_loc_id}]
+  const employeeNames = {};       // employee_code -> name
+  const included = {};            // 'date|code' -> true
 
   if (lastRow >= 2) {
     const values = t.sheet.getRange(2, 1, lastRow - 1, t.headers.length).getValues();
@@ -1068,17 +1216,31 @@ function handleReport(req) {
 
       const code = String(r[t.col.employee_code]).trim();
       if (!code) return;
-      if (empFilter && code.toUpperCase() !== empFilter) return;
-      if (locFilter && String(r[t.col.practice_loc_id]).trim() !== locFilter) return;
 
       employeeNames[code] = String(r[t.col.employee_name]);
-      if (!perEmployeeDate[code]) perEmployeeDate[code] = {};
-      // Rows are in chronological (append) order, so the last matching row
-      // for a given day is that day's final worked-hours value — same rule
-      // buildWeeklySummary() uses.
-      perEmployeeDate[code][bDate] = isNum(r[t.col.worked_hours]) ? Number(r[t.col.worked_hours]) : 0;
+      const key = bDate + '|' + code;
+      (eventsByDayEmployee[key] = eventsByDayEmployee[key] || []).push({
+        type: String(r[t.col.punch_type]),
+        punched_at: new Date(r[t.col.punched_at]),
+        practice_loc_id: String(r[t.col.practice_loc_id] || '')
+      });
+
+      if (!employeeMatches(code)) return;
+      if (locFilter && String(r[t.col.practice_loc_id]).trim() !== locFilter) return;
+      included[key] = true;
     });
   }
+
+  // Pass 2: recompute hours only for included days, from that day's full event list.
+  const perEmployeeDate = {}; // employee_code -> { business_date -> worked_hours }
+  Object.keys(included).forEach(key => {
+    const sep = key.indexOf('|');
+    const bDate = key.slice(0, sep);
+    const code = key.slice(sep + 1);
+    const worked = recomputeDayWorked(code, bDate, eventsByDayEmployee[key]);
+    if (!perEmployeeDate[code]) perEmployeeDate[code] = {};
+    perEmployeeDate[code][bDate] = worked.hours;
+  });
 
   const employeeCodes = Object.keys(perEmployeeDate).sort();
   if (!employeeCodes.length) {
@@ -1103,13 +1265,18 @@ function handleReport(req) {
     );
   });
 
+  const empDescParts = [];
+  if (empCodesFilter.length) empDescParts.push(empCodesFilter.join(', '));
+  if (empPrefixFilter.length) empDescParts.push(empPrefixFilter.map(p => p + '*').join(', '));
+  const empDesc = empDescParts.length ? empDescParts.join(' + ') : 'All employees';
+
   const ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
   let sh = ss.getSheetByName('report');
   if (!sh) sh = ss.insertSheet('report');
   sh.clear();
 
   const title = 'Attendance Report — ' + (locFilter || 'All locations') + ' — ' +
-                (empFilter || 'All employees') + ' — ' + startDate + ' to ' + endDate +
+                empDesc + ' — ' + startDate + ' to ' + endDate +
                 ' (generated ' + Utilities.formatDate(new Date(), CONFIG.TZ, 'yyyy-MM-dd HH:mm') + ')';
   sh.getRange(1, 1).setValue(title);
   sh.getRange(2, 1, 1, headerRow.length).setValues([headerRow]);
