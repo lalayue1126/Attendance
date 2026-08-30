@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#16202B">
+<title>Add Schedule</title>
+<style>
+  :root{
+    --ink:#16202B;
+    --ink-soft:#3A4753;
+    --muted:#6B7780;
+    --line:#D8DEDC;
+    --paper:#EFF2F1;
+    --card:#FFFFFF;
+    --ok:#0F6E4F;
+    --ok-bg:#E4F1EB;
+    --warn:#9A4C15;
+    --warn-bg:#FBEEE2;
+    --err:#9B2C2C;
+    --err-bg:#FBEAEA;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:var(--paper);
+    color:var(--ink);
+    font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    font-size:16px;line-height:1.6;
+    min-height:100vh;
+    padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom);
+  }
+  .wrap{max-width:480px;margin:0 auto;padding:24px 16px 40px}
+
+  .band{background:var(--ink);color:#fff;margin:0 -16px 20px;padding:18px 20px 16px}
+  .band .eyebrow{
+    font-family:var(--mono);font-size:12px;letter-spacing:.14em;
+    text-transform:uppercase;color:#8FA2B0;margin:0 0 4px;
+  }
+  .band .title{font-size:21px;font-weight:600;margin:0}
+
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:18px;margin-bottom:16px}
+  h2{font-size:15px;font-weight:600;margin:0 0 12px;color:var(--ink-soft)}
+  .note{font-size:13.5px;color:var(--muted);margin:0 0 14px;line-height:1.55}
+
+  label{display:block;font-size:13px;font-weight:600;color:var(--ink-soft);margin:0 0 6px}
+  .field{margin-bottom:14px}
+  input,select{
+    width:100%;padding:12px;font-size:16px;font-family:inherit;
+    border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--ink);
+  }
+  input:focus,select:focus{outline:2px solid var(--ink);outline-offset:1px;border-color:var(--ink)}
+  .row{display:flex;gap:10px}
+  .row .field{flex:1 1 0}
+
+  .weekday-grid{display:flex;gap:6px;flex-wrap:wrap}
+  .weekday-btn{
+    flex:1 1 0;min-width:40px;min-height:44px;padding:8px 4px;
+    background:#fff;color:var(--ink-soft);border:1px solid var(--line);
+    border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;
+  }
+  .weekday-btn.selected{background:var(--ink);color:#fff;border-color:var(--ink)}
+
+  button{
+    font-family:inherit;font-size:16px;font-weight:600;
+    border-radius:10px;border:1px solid transparent;
+    cursor:pointer;width:100%;padding:14px;
+  }
+  button:disabled{opacity:.45;cursor:not-allowed}
+  .btn-primary{background:var(--ink);color:#fff}
+  .btn-secondary{background:#fff;border-color:var(--line);color:var(--ink-soft)}
+  .btn-inline{width:auto;flex:0 0 auto;padding:0 18px;background:var(--ink);color:#fff}
+
+  .add-date-row{display:flex;gap:8px;align-items:stretch;margin-bottom:10px}
+  .add-date-row .field{flex:1 1 auto;margin-bottom:0}
+
+  .date-chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px}
+  .date-chip{
+    display:inline-flex;align-items:center;gap:6px;
+    background:var(--paper);border:1px solid var(--line);border-radius:999px;
+    padding:6px 6px 6px 12px;font-size:13px;font-family:var(--mono);color:var(--ink-soft);
+  }
+  .date-chip-remove{
+    width:20px;height:20px;padding:0;border-radius:50%;
+    background:var(--line);color:var(--ink-soft);font-size:13px;font-weight:700;line-height:1;
+    display:flex;align-items:center;justify-content:center;
+  }
+
+  .msg{padding:12px 14px;border-radius:8px;font-size:14px;margin-bottom:14px;line-height:1.55}
+  .msg.err{background:var(--err-bg);color:var(--err)}
+  .msg.warn{background:var(--warn-bg);color:var(--warn)}
+  .msg.ok{background:var(--ok-bg);color:var(--ok)}
+  .hide{display:none}
+
+  .spacer{height:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="band">
+    <p class="eyebrow">Admin only</p>
+    <p class="title">Add Schedule</p>
+  </div>
+
+  <!-- Step 1: unlock -->
+  <section id="scr-lock" class="card">
+    <h2>Password</h2>
+    <p class="note">Same password as the attendance report.</p>
+    <div id="lock-msg"></div>
+    <div class="field">
+      <input id="f-password" type="password" autocomplete="off" placeholder="Admin password">
+    </div>
+    <button class="btn-primary" id="btn-unlock">Unlock</button>
+  </section>
+
+  <!-- Step 2: form -->
+  <section id="scr-form" class="card hide">
+    <h2>When does this apply?</h2>
+    <div id="form-msg"></div>
+
+    <div class="row">
+      <div class="field">
+        <label for="f-start">From</label>
+        <input id="f-start" type="date">
+      </div>
+      <div class="field">
+        <label for="f-end">To</label>
+        <input id="f-end" type="date">
+      </div>
+    </div>
+
+    <div class="field">
+      <label>Which days of the week</label>
+      <p class="note" style="margin:0 0 8px">
+        A row is added for every date in the range above that falls on one
+        of the selected days. Leave From/To and the weekdays untouched if
+        you're only adding individual dates below.
+      </p>
+      <div class="weekday-grid" id="weekday-grid"></div>
+    </div>
+
+    <h2 style="margin-top:20px">Or add individual dates</h2>
+    <p class="note">
+      For one-off days that don't follow the weekly pattern above. You can
+      use this on its own, or combine it with the range/weekdays above —
+      both get added together.
+    </p>
+    <div class="add-date-row">
+      <div class="field">
+        <input id="f-single-date" type="date">
+      </div>
+      <button type="button" class="btn-inline" id="btn-add-date">Add</button>
+    </div>
+    <div class="date-chips" id="date-chips"></div>
+
+    <h2 style="margin-top:20px">What's the schedule</h2>
+
+    <div class="row">
+      <div class="field">
+        <label for="f-time">Start time</label>
+        <input id="f-time" type="time">
+      </div>
+      <div class="field">
+        <label for="f-hours">Hours</label>
+        <input id="f-hours" type="number" step="0.25" min="0" placeholder="3">
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="f-location">Practice Location</label>
+      <select id="f-location">
+        <option value="">Any location</option>
+      </select>
+    </div>
+
+    <div class="field">
+      <label for="f-employee">Employee code (leave blank for everyone)</label>
+      <input id="f-employee" type="text" placeholder="e.g. E001">
+    </div>
+
+    <div class="field">
+      <label for="f-note">Note (optional)</label>
+      <input id="f-note" type="text">
+    </div>
+
+    <button class="btn-primary" id="btn-add">Add to Schedule</button>
+    <div class="spacer"></div>
+    <button class="btn-secondary" id="btn-sort">Sort Schedule Sheet Now</button>
+    <div class="spacer"></div>
+    <button class="btn-secondary" id="btn-relock">Lock again</button>
+  </section>
+
+</div>
+
+<script>
+/* ══════════════════════════════════════════
+   Config — same backend as index.html / report.html
+   ══════════════════════════════════════════ */
+const CONFIG = {
+  API_URL: 'https://script.google.com/macros/s/AKfycbzevhLv-1CXcH3yhRgHTt6v1vQ7opNhP1dEkQzmni_x6tAXnCOIbShW4pjd9Mjs882EBQ/exec',
+  FETCH_TIMEOUT_MS: 25000
+};
+
+const $ = id => document.getElementById(id);
+
+function show(name){
+  $('scr-lock').classList.toggle('hide', name !== 'lock');
+  $('scr-form').classList.toggle('hide', name !== 'form');
+}
+function setMsg(el, text, kind){
+  el.innerHTML = text ? `<div class="msg ${kind||'err'}">${esc(text)}</div>` : '';
+}
+function esc(s){
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function api(payload){
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), CONFIG.FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(CONFIG.API_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(payload),
+      signal: ctrl.signal
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    return await res.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+const state = { password: '', selectedWeekdays: new Set(), individualDates: new Set() };
+const WEEKDAYS = [
+  { value: 0, label: 'Sun' }, { value: 1, label: 'Mon' }, { value: 2, label: 'Tue' },
+  { value: 3, label: 'Wed' }, { value: 4, label: 'Thu' }, { value: 5, label: 'Fri' },
+  { value: 6, label: 'Sat' }
+];
+
+function renderWeekdayGrid(){
+  const grid = $('weekday-grid');
+  grid.innerHTML = '';
+  WEEKDAYS.forEach(w => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'weekday-btn';
+    b.textContent = w.label;
+    b.onclick = () => {
+      if (state.selectedWeekdays.has(w.value)) state.selectedWeekdays.delete(w.value);
+      else state.selectedWeekdays.add(w.value);
+      b.classList.toggle('selected', state.selectedWeekdays.has(w.value));
+    };
+    grid.appendChild(b);
+  });
+}
+renderWeekdayGrid();
+
+/* ── Individual dates: added one at a time, shown as removable chips ── */
+function renderDateChips(){
+  const box = $('date-chips');
+  box.innerHTML = '';
+  Array.from(state.individualDates).sort().forEach(d => {
+    const chip = document.createElement('span');
+    chip.className = 'date-chip';
+    chip.textContent = d;
+    const x = document.createElement('button');
+    x.type = 'button';
+    x.className = 'date-chip-remove';
+    x.textContent = '×';
+    x.onclick = () => { state.individualDates.delete(d); renderDateChips(); };
+    chip.appendChild(x);
+    box.appendChild(chip);
+  });
+}
+function addSingleDate(){
+  const d = $('f-single-date').value;
+  if (!d) return;
+  state.individualDates.add(d);
+  $('f-single-date').value = '';
+  renderDateChips();
+}
+$('btn-add-date').onclick = addSingleDate;
+$('f-single-date').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); addSingleDate(); } });
+
+/* ── Step 1: unlock ───────────────────── */
+async function unlock(){
+  const pw = $('f-password').value;
+  if (!pw) return setMsg($('lock-msg'), 'Please enter the admin password.');
+
+  const btn = $('btn-unlock');
+  btn.disabled = true; btn.textContent = 'Checking…';
+  setMsg($('lock-msg'), '');
+
+  try {
+    const r = await api({ action:'schedule_meta', password: pw });
+    if (!r.ok){
+      const m = { BAD_PASSWORD: 'Incorrect password.' };
+      return setMsg($('lock-msg'), m[r.error] || r.message || 'Something went wrong.');
+    }
+    state.password = pw;
+    populateLocations(r.locations);
+
+    const today = new Date();
+    const p = n => String(n).padStart(2,'0');
+    const todayStr = `${today.getFullYear()}-${p(today.getMonth()+1)}-${p(today.getDate())}`;
+    if (!$('f-start').value) $('f-start').value = todayStr;
+    if (!$('f-end').value) $('f-end').value = todayStr;
+
+    show('form');
+  } catch(e){
+    setMsg($('lock-msg'), 'Couldn’t connect. Please try again.');
+  } finally {
+    btn.disabled = false; btn.textContent = 'Unlock';
+  }
+}
+
+function populateLocations(locations){
+  const sel = $('f-location');
+  const first = sel.querySelector('option');
+  sel.innerHTML = '';
+  sel.appendChild(first);
+  locations.forEach(loc => {
+    const opt = document.createElement('option');
+    opt.value = loc.id;
+    opt.textContent = loc.label;
+    sel.appendChild(opt);
+  });
+}
+
+/* ── Step 2: add ───────────────────── */
+async function addSchedule(){
+  const start = $('f-start').value;
+  const end = $('f-end').value;
+  const usingRange = start || end || state.selectedWeekdays.size;
+  const individualDates = Array.from(state.individualDates);
+
+  if (usingRange){
+    if (!start || !end) return setMsg($('form-msg'), 'Please choose both a start and end date, or clear them if you’re only adding individual dates.');
+    if (start > end) return setMsg($('form-msg'), 'The start date must be before the end date.');
+    if (!state.selectedWeekdays.size) return setMsg($('form-msg'), 'Please select at least one day of the week, or clear the date range if you’re only adding individual dates.');
+  }
+  if (!usingRange && !individualDates.length){
+    return setMsg($('form-msg'), 'Please add at least one date — individually below, or via a date range and weekdays above.');
+  }
+
+  const time = $('f-time').value;
+  const hours = $('f-hours').value;
+  if (!time) return setMsg($('form-msg'), 'Please enter a start time.');
+  if (!hours || Number(hours) <= 0) return setMsg($('form-msg'), 'Please enter a number of hours greater than 0.');
+
+  const btn = $('btn-add');
+  btn.disabled = true; btn.textContent = 'Adding…';
+  setMsg($('form-msg'), '');
+
+  try {
+    const r = await api({
+      action: 'add_schedule',
+      password: state.password,
+      start_date: start,
+      end_date: end,
+      weekdays: Array.from(state.selectedWeekdays),
+      dates: individualDates,
+      scheduled_start: time,
+      scheduled_hours: Number(hours),
+      practice_loc_id: $('f-location').value,
+      employee_code: $('f-employee').value.trim(),
+      note: $('f-note').value.trim()
+    });
+
+    if (!r.ok){
+      const m = {
+        BAD_PASSWORD: 'Incorrect password — please lock and unlock again.',
+        BAD_RANGE: 'Please select a valid date range.',
+        NO_WEEKDAYS: 'Please select at least one day of the week.',
+        BAD_SCHEDULE: 'Please enter a valid start time and number of hours.',
+        RANGE_TOO_LARGE: 'That’s too many dates at once — please narrow it down.',
+        NO_DATES: 'Please add at least one date — individually, or via a date range and weekdays.'
+      };
+      return setMsg($('form-msg'), m[r.error] || r.message || 'Something went wrong.', 'err');
+    }
+
+    setMsg($('form-msg'), `Added ${r.added} date(s) to the schedule. The sheet has been re-sorted by date and time.`, 'ok');
+
+    // Clear the date pickers so the same dates aren't accidentally added twice,
+    // but leave the time/hours/location/employee/note as-is for the next entry.
+    state.selectedWeekdays.clear();
+    document.querySelectorAll('#weekday-grid .weekday-btn.selected').forEach(b => b.classList.remove('selected'));
+    state.individualDates.clear();
+    renderDateChips();
+    $('f-start').value = '';
+    $('f-end').value = '';
+  } catch(e){
+    setMsg($('form-msg'), 'Couldn’t connect. Please try again.', 'err');
+  } finally {
+    btn.disabled = false; btn.textContent = 'Add to Schedule';
+  }
+}
+
+async function sortNow(){
+  const btn = $('btn-sort');
+  btn.disabled = true; btn.textContent = 'Sorting…';
+  setMsg($('form-msg'), '');
+  try {
+    const r = await api({ action:'sort_schedule', password: state.password });
+    if (!r.ok){
+      return setMsg($('form-msg'), r.message || 'Something went wrong.', 'err');
+    }
+    setMsg($('form-msg'), 'Schedule sheet sorted by date and time.', 'ok');
+  } catch(e){
+    setMsg($('form-msg'), 'Couldn’t connect. Please try again.', 'err');
+  } finally {
+    btn.disabled = false; btn.textContent = 'Sort Schedule Sheet Now';
+  }
+}
+
+/* ── Wiring ───────────────── */
+$('btn-unlock').onclick = unlock;
+$('f-password').addEventListener('keydown', e => { if (e.key === 'Enter') unlock(); });
+$('btn-add').onclick = addSchedule;
+$('btn-sort').onclick = sortNow;
+$('btn-relock').onclick = () => {
+  state.password = '';
+  $('f-password').value = '';
+  setMsg($('lock-msg'), '');
+  show('lock');
+};
+
+show('lock');
+</script>
+</body>
+</html>

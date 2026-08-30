@@ -12,7 +12,8 @@
  *        Who has access: Anyone
  *   4. Paste the issued /exec URL into CONFIG.API_URL in index.html
  *   5. Enter each date's scheduled hours (start time + hours) into the
- *      schedules sheet by hand. employee_code and practice_loc_id are both
+ *      schedules sheet by hand — or use schedule.html (see below) to add
+ *      many dates at once. employee_code and practice_loc_id are both
  *      optional — leave employee_code blank for "everyone" and
  *      practice_loc_id blank for "any location". This lets different staff
  *      working at the same location have different hours, and the same
@@ -27,9 +28,8 @@
  *      → Every Monday at 3am, last week's (Mon–Sun) worked hours per
  *        employee are automatically summarized into weekly_summary
  *   8. Set a password in setReportPassword() and run it once
- *      → This password gates report.html, the admin-only page that builds
- *        the attendance report (by location / employee / date range) and
- *        writes it into the "report" sheet.
+ *      → This password gates report.html AND schedule.html, the two
+ *        admin-only pages (see below).
  *
  *  【Only 2 links are distributed to staff】
  *   Fixed locations : index.html?l=FIXED     (one shared link for all fixed sites)
@@ -39,9 +39,14 @@
  *   "Practice Location" buttons, sourced from locations rows matching
  *   that type.
  *
- *  【Admin-only report page】
- *   report.html (also on GitHub Pages) — password-protected, builds a
- *   pivot report (employees × dates) and writes it to the "report" sheet.
+ *  【Admin-only pages (both on GitHub Pages, both password-protected)】
+ *   report.html   — builds a pivot report (employees × dates) and writes
+ *                    it into the "report" sheet.
+ *   schedule.html — bulk-adds schedules rows: pick a date range + which
+ *                    weekdays practice falls on, plus the (usually fixed)
+ *                    start time / hours / location, and it creates one row
+ *                    per matching date. Keeps the schedules sheet sorted
+ *                    by date automatically (sortSchedulesSheet()).
  * ══════════════════════════════════════════════════════════════
  */
 
@@ -100,11 +105,14 @@ function doPost(e) {
     const req = JSON.parse(e.postData.contents);
 
     switch (req.action) {
-      case 'register':    return json(handleRegister(req));
-      case 'state':       return json(handleState(req));
-      case 'punch':       return json(handlePunch(req));
-      case 'report_meta': return json(handleReportMeta(req));
-      case 'report':      return json(handleReport(req));
+      case 'register':      return json(handleRegister(req));
+      case 'state':         return json(handleState(req));
+      case 'punch':         return json(handlePunch(req));
+      case 'report_meta':   return json(handleReportMeta(req));
+      case 'report':        return json(handleReport(req));
+      case 'schedule_meta': return json(handleScheduleMeta(req));
+      case 'add_schedule':  return json(handleAddSchedule(req));
+      case 'sort_schedule': return json(handleSortSchedule(req));
       default:
         return json({ ok: false, error: 'BAD_ACTION', message: 'Unknown action.' });
     }
@@ -1086,9 +1094,9 @@ function installWeeklyTrigger() {
    ════════════════════════════════════════════ */
 
 /**
- * Sets (or changes) the password required to generate the attendance report
- * from report.html. Anyone with this password can see every employee's
- * hours, so treat it like any other shared admin credential.
+ * Sets (or changes) the shared admin password. This gates BOTH report.html
+ * (viewing every employee's hours) and schedule.html (bulk-adding rows to
+ * the schedules sheet). Treat it like any other shared admin credential.
  * Edit the password below, then run this function once.
  */
 function setReportPassword() {
@@ -1304,4 +1312,154 @@ function handleReport(req) {
     employee_count: dataRows.length,
     date_count: dates.length
   };
+}
+
+
+/* ════════════════════════════════════════════
+   10. Bulk schedule entry (admin, password-protected)
+   ════════════════════════════════════════════ */
+
+/**
+ * Returns the practice-location dropdown options for schedule.html.
+ * Requires the shared admin password (same one as report.html).
+ */
+function handleScheduleMeta(req) {
+  if (!checkReportPassword(req.password)) {
+    return { ok: false, error: 'BAD_PASSWORD', message: 'Incorrect password.' };
+  }
+
+  const locations = readTable(SHEETS.LOCATIONS).rows
+    .filter(r => truthy(r.is_active))
+    .map(r => ({ id: String(r.loc_id), label: String(r.name) + ' (' + String(r.type) + ')' }));
+
+  return { ok: true, locations: locations };
+}
+
+/**
+ * Adds one schedules row for every matching date, all sharing the same start
+ * time / hours / location / employee / note. Meant for the common case where
+ * practice happens at the same time and place for weeks at a stretch, so the
+ * admin doesn't have to type one row per date. Dates come from two optional,
+ * combinable sources — at least one must produce a date:
+ *   - A recurring pattern: start_date + end_date + weekdays (0=Sun..6=Sat).
+ *     All three are required together if any of them is given.
+ *   - Individually picked dates: the dates array ('yyyy-MM-dd' strings),
+ *     for one-off days that don't fit a weekly pattern.
+ * The two sources are merged and de-duplicated, so a recurring pattern and a
+ * few extra individual dates can be submitted in the same request.
+ *
+ * employee_code and practice_loc_id are optional, same as manual entry:
+ * blank employee_code = everyone, blank practice_loc_id = any location.
+ *
+ * After adding the rows, the whole schedules sheet is re-sorted by date and
+ * time (sortSchedulesSheet()) so it stays in chronological order.
+ */
+function handleAddSchedule(req) {
+  if (!checkReportPassword(req.password)) {
+    return { ok: false, error: 'BAD_PASSWORD', message: 'Incorrect password.' };
+  }
+
+  const startDate = String(req.start_date || '').trim();
+  const endDate = String(req.end_date || '').trim();
+  const weekdays = (Array.isArray(req.weekdays) ? req.weekdays : []).map(Number);
+  const individualDates = (Array.isArray(req.dates) ? req.dates : [])
+    .map(d => String(d).trim()).filter(Boolean);
+
+  const rangeDates = [];
+  const wantsRange = startDate || endDate || weekdays.length;
+  if (wantsRange) {
+    if (!startDate || !endDate || startDate > endDate) {
+      return { ok: false, error: 'BAD_RANGE', message: 'Please select a valid date range.' };
+    }
+    if (!weekdays.length) {
+      return { ok: false, error: 'NO_WEEKDAYS', message: 'Please select at least one day of the week.' };
+    }
+    for (let d = startDate; d <= endDate; d = addDays(d, 1)) {
+      const dow = Utilities.parseDate(d, CONFIG.TZ, 'yyyy-MM-dd').getDay(); // 0=Sun..6=Sat, same convention as mondayOfWeek()
+      if (weekdays.indexOf(dow) !== -1) rangeDates.push(d);
+      if (rangeDates.length > 366) {
+        return { ok: false, error: 'RANGE_TOO_LARGE', message: 'That range is too large — please narrow it down.' };
+      }
+    }
+  }
+
+  const dates = Array.from(new Set(rangeDates.concat(individualDates))).sort();
+  if (!dates.length) {
+    return { ok: false, error: 'NO_DATES', message: 'Please add at least one date — individually, or via a date range and weekdays.' };
+  }
+  if (dates.length > 366) {
+    return { ok: false, error: 'RANGE_TOO_LARGE', message: 'That’s too many dates at once — please narrow it down.' };
+  }
+
+  const scheduledStart = String(req.scheduled_start || '').trim();
+  const scheduledHours = Number(req.scheduled_hours);
+  if (!scheduledStart || !isNum(scheduledHours) || scheduledHours <= 0) {
+    return { ok: false, error: 'BAD_SCHEDULE', message: 'Please enter a valid start time and number of hours.' };
+  }
+
+  const employeeCode = String(req.employee_code || '').trim().toUpperCase();
+  const practiceLocId = String(req.practice_loc_id || '').trim();
+  const note = String(req.note || '').trim();
+
+  dates.forEach(d => {
+    appendRowByHeader(SHEETS.SCHEDULES, {
+      business_date: d,
+      employee_code: employeeCode,
+      practice_loc_id: practiceLocId,
+      scheduled_start: scheduledStart,
+      scheduled_hours: scheduledHours,
+      note: note
+    });
+  });
+
+  sortSchedulesSheet();
+
+  return { ok: true, added: dates.length };
+}
+
+/** Re-sorts the schedules sheet by date without adding anything, for cleaning up rows added by hand. */
+function handleSortSchedule(req) {
+  if (!checkReportPassword(req.password)) {
+    return { ok: false, error: 'BAD_PASSWORD', message: 'Incorrect password.' };
+  }
+  sortSchedulesSheet();
+  return { ok: true };
+}
+
+/**
+ * Sorts every row in the schedules sheet by business_date, then by
+ * scheduled_start within the same date, earliest first. Also normalizes
+ * both to a consistent text format while sorting — some rows were typed
+ * inconsistently (e.g. "2026-8-23" instead of "2026-08-23", or "9:30"
+ * instead of "09:30"), which sorts wrong as plain text even though the
+ * values are the same. Safe to run any time; it only reorders rows and
+ * rewrites the business_date/scheduled_start columns, nothing else changes.
+ */
+function sortSchedulesSheet() {
+  const t = readTable(SHEETS.SCHEDULES);
+  if (!t.rows.length) return;
+
+  const padTime = v => {
+    const s = normalizeTimeStr(v);
+    const m = s.match(/^(\d{1,2}):(\d{2})$/);
+    return m ? m[1].padStart(2, '0') + ':' + m[2] : s;
+  };
+
+  const rows = t.rows.map(r => {
+    const copy = Object.assign({}, r);
+    copy.business_date = normalizeDateStr(r.business_date);
+    copy.scheduled_start = padTime(r.scheduled_start);
+    return copy;
+  });
+  rows.sort((a, b) => {
+    if (a.business_date !== b.business_date) return a.business_date < b.business_date ? -1 : 1;
+    if (a.scheduled_start !== b.scheduled_start) return a.scheduled_start < b.scheduled_start ? -1 : 1;
+    return 0;
+  });
+
+  const values = rows.map(r => t.headers.map(h => {
+    const key = String(h).trim();
+    return r[key] !== undefined ? r[key] : '';
+  }));
+  t.sheet.getRange(2, 1, values.length, t.headers.length).setValues(values);
 }
