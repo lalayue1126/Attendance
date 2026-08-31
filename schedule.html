@@ -94,6 +94,16 @@
   .hide{display:none}
 
   .spacer{height:12px}
+
+  /* Native date/time inputs need more width than a 50% column leaves on
+     narrow phones, which is what was misaligning things — stack instead. */
+  @media (max-width: 480px) {
+    .row{flex-direction:column}
+    .add-date-row{flex-direction:column;align-items:stretch}
+    .add-date-row .field{margin-bottom:10px}
+    .btn-inline{width:100%}
+    .weekday-btn{min-width:32px}
+  }
 </style>
 </head>
 <body>
@@ -176,8 +186,8 @@
     </div>
 
     <div class="field">
-      <label for="f-employee">Employee code (leave blank for everyone)</label>
-      <input id="f-employee" type="text" placeholder="e.g. E001">
+      <label for="f-player">Player code (leave blank for everyone)</label>
+      <input id="f-player" type="text" placeholder="e.g. E001">
     </div>
 
     <div class="field">
@@ -366,7 +376,7 @@ async function addSchedule(){
       scheduled_start: time,
       scheduled_hours: Number(hours),
       practice_loc_id: $('f-location').value,
-      employee_code: $('f-employee').value.trim(),
+      employee_code: $('f-player').value.trim(),
       note: $('f-note').value.trim()
     });
 
@@ -385,7 +395,7 @@ async function addSchedule(){
     setMsg($('form-msg'), `Added ${r.added} date(s) to the schedule. The sheet has been re-sorted by date and time.`, 'ok');
 
     // Clear the date pickers so the same dates aren't accidentally added twice,
-    // but leave the time/hours/location/employee/note as-is for the next entry.
+    // but leave the time/hours/location/player/note as-is for the next entry.
     state.selectedWeekdays.clear();
     document.querySelectorAll('#weekday-grid .weekday-btn.selected').forEach(b => b.classList.remove('selected'));
     state.individualDates.clear();

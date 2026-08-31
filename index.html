@@ -161,7 +161,7 @@
     <p class="note">This is a one-time setup. After this, just tap to check in or out.</p>
     <div id="reg-msg"></div>
     <div class="field">
-      <label for="f-code">Employee Code</label>
+      <label for="f-code">Player Code</label>
       <input id="f-code" type="text" inputmode="latin" autocapitalize="characters"
              autocomplete="off" placeholder="E001">
     </div>
@@ -560,7 +560,7 @@ async function register(){
   const pin  = $('f-pin').value.trim();
   setMsg($('reg-msg'), '');
 
-  if (!code) return setMsg($('reg-msg'), 'Please enter your employee code.');
+  if (!code) return setMsg($('reg-msg'), 'Please enter your player code.');
   if (!pin)  return setMsg($('reg-msg'), 'Please enter your PIN.');
 
   const btn = $('btn-register');
@@ -569,7 +569,7 @@ async function register(){
     const r = await api({ action:'register', employee_code:code, pin:pin,
                           label: navigator.userAgent.slice(0, 40) });
     if (!r.ok){
-      const m = { BAD_PIN:'Incorrect PIN.', NOT_FOUND:'This employee code is not registered.' };
+      const m = { BAD_PIN:'Incorrect PIN.', NOT_FOUND:'This player code is not registered.' };
       return setMsg($('reg-msg'), m[r.error] || 'Couldn’t register. Please contact your administrator.');
     }
     state.token = r.token;
@@ -598,7 +598,7 @@ $('btn-retry').onclick = () => location.reload();
 $('btn-register').onclick = register;
 $('f-pin').addEventListener('keydown', e => { if (e.key === 'Enter') register(); });
 $('btn-reset').onclick = () => {
-  if (confirm('This will unregister this device. Next time, you’ll need to enter your employee code and PIN again.')){
+  if (confirm('This will unregister this device. Next time, you’ll need to enter your player code and PIN again.')){
     store(TOKEN_KEY, null);
     location.reload();
   }

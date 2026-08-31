@@ -79,6 +79,12 @@
 
   .result a{color:var(--ok);font-weight:600}
   .spacer{height:12px}
+
+  /* Native date inputs need more width than a 50% column leaves on narrow
+     phones, which misaligns the From/To row — stack instead. */
+  @media (max-width: 480px) {
+    .row{flex-direction:column}
+  }
 </style>
 </head>
 <body>
@@ -92,7 +98,7 @@
   <!-- Step 1: unlock -->
   <section id="scr-lock" class="card">
     <h2>Password</h2>
-    <p class="note">This page shows every employee's hours, so it's protected by an admin password.</p>
+    <p class="note">This page shows every player's hours, so it's protected by an admin password.</p>
     <div id="lock-msg"></div>
     <div class="field">
       <input id="f-password" type="password" autocomplete="off" placeholder="Report password">
@@ -113,14 +119,14 @@
     </div>
 
     <div class="field">
-      <label>Employees</label>
+      <label>Players</label>
       <p class="note" style="margin:0 0 8px">
-        Leave everything below unchecked/unselected for all employees.
+        Leave everything below unchecked/unselected for all players.
         Check a letter to include everyone whose code starts with it, and/or
         pick specific people from that letter's list (Ctrl/Cmd-click,
         or tap each name on mobile, to select more than one).
       </p>
-      <div id="employee-groups"></div>
+      <div id="player-groups"></div>
     </div>
 
     <div class="row">
@@ -207,7 +213,7 @@ async function unlock(){
     }
     state.password = pw;
     populateSelect('f-location', r.locations, l => [l.id, l.label], true);
-    renderEmployeeGroups(r.employees);
+    renderPlayerGroups(r.employees);
 
     const today = new Date();
     const p = n => String(n).padStart(2,'0');
@@ -237,16 +243,16 @@ function populateSelect(id, items, mapFn, keepFirst){
   });
 }
 
-/* ── Employee groups: one per first letter of employee_code (E/N/Y/S/…),
+/* ── Player groups: one per first letter of the player code (E/N/Y/S/…),
    each with a "select all in this group" checkbox plus a multi-select of
    individual names. Groups are built from whatever letters are actually
    in use, so an unexpected prefix still gets its own group instead of
    being hidden. ── */
 const KNOWN_PREFIXES = ['E', 'A', 'N', 'S', 'Y'];
 
-function renderEmployeeGroups(employees){
+function renderPlayerGroups(players){
   const groups = {}; // letter -> [{code,name}]
-  employees.forEach(e => {
+  players.forEach(e => {
     const letter = /^[A-Za-z]/.test(e.code) ? e.code.charAt(0).toUpperCase() : 'Other';
     (groups[letter] = groups[letter] || []).push(e);
   });
@@ -259,7 +265,7 @@ function renderEmployeeGroups(employees){
     return ka - kb;
   });
 
-  const container = $('employee-groups');
+  const container = $('player-groups');
   container.innerHTML = '';
 
   letters.forEach(letter => {
@@ -291,7 +297,7 @@ function renderEmployeeGroups(employees){
       });
 
     // Checking "select all" for a letter covers everyone with that prefix
-    // (including future employees), so the individual picker underneath
+    // (including future players), so the individual picker underneath
     // becomes redundant — disable and clear it to avoid a confusing
     // double-signal.
     cb.addEventListener('change', () => {
@@ -305,10 +311,10 @@ function renderEmployeeGroups(employees){
   });
 }
 
-function collectEmployeeSelection(){
-  const prefixes = Array.from(document.querySelectorAll('#employee-groups input[type=checkbox]:checked'))
+function collectPlayerSelection(){
+  const prefixes = Array.from(document.querySelectorAll('#player-groups input[type=checkbox]:checked'))
     .map(cb => cb.dataset.prefix);
-  const codes = Array.from(document.querySelectorAll('#employee-groups select'))
+  const codes = Array.from(document.querySelectorAll('#player-groups select'))
     .filter(sel => !sel.disabled)
     .flatMap(sel => Array.from(sel.selectedOptions).map(o => o.value));
   return { prefixes, codes };
@@ -325,7 +331,7 @@ async function generate(){
   btn.disabled = true; btn.textContent = 'Generating…';
   setMsg($('form-msg'), '');
 
-  const emp = collectEmployeeSelection();
+  const emp = collectPlayerSelection();
 
   try {
     const r = await api({
@@ -349,7 +355,7 @@ async function generate(){
     }
 
     $('result-msg').innerHTML =
-      `<p>Report written to the <strong>report</strong> sheet: ${r.employee_count} employee(s) × ${r.date_count} day(s).</p>` +
+      `<p>Report written to the <strong>report</strong> sheet: ${r.employee_count} player(s) × ${r.date_count} day(s).</p>` +
       `<p><a href="${r.sheet_url}" target="_blank" rel="noopener">Open the spreadsheet</a></p>`;
     show('result');
   } catch(e){
