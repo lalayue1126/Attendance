@@ -488,13 +488,17 @@ function findSchedule(businessDateStr, employeeCode, practiceLocId, referenceTim
     }
   }
 
-  if (best) return best;
+  if (best) {
+    best.matched = true;
+    return best;
+  }
   return {
     business_date: businessDateStr,
     employee_code: '',
     practice_loc_id: '',
     scheduled_start: CONFIG.DEFAULT_SCHEDULED_START,
-    scheduled_hours: CONFIG.DEFAULT_SCHEDULED_HOURS
+    scheduled_hours: CONFIG.DEFAULT_SCHEDULED_HOURS,
+    matched: false
   };
 }
 
@@ -1169,6 +1173,10 @@ function handleReportMeta(req) {
  * A row matches if it's in employee_codes OR its prefix is in
  * employee_prefixes; if both arrays are empty, every employee is included.
  *
+ * Every active, registered employee matching the filter gets a row, even
+ * one with zero punches in the whole range — a player who never checked in
+ * shows up as 0 hours / 0% rather than being silently omitted.
+ *
  * Layout: one row per employee, one column per date in the range, plus
  * Total Hours / Attendance Rate columns. Every date column and Total Hours
  * are formatted to always show 2 decimal places (e.g. "3.00"), since that's
@@ -1185,16 +1193,18 @@ function handleReportMeta(req) {
  *                     once included, ALL of that day's punches (at any
  *                     location) feed into the hours calculation, matching
  *                     how a single day's total has always been computed.
- *   - Attendance Rate: Total Hours divided by the employee's scheduled hours
- *                     (summed via findSchedule() for every date in the
- *                     range, using the same employee/location priority
- *                     rules as the live worked-hours calculation), as a
- *                     percentage. The scheduled-hours total itself isn't
- *                     shown as a column, only this derived rate.
- *                     Note: every date in the range is treated as an expected
- *                     work day — this system has no explicit "day off" flag,
- *                     so a range that includes non-working days will inflate
- *                     the scheduled total and understate the attendance rate.
+ *   - Attendance Rate: count-based, not hours-based. For every date in the
+ *                     range, findSchedule() (same employee/location priority
+ *                     rules as the live worked-hours calculation) checks
+ *                     whether an actual practice was scheduled for that
+ *                     employee that day (schedule.matched — the CONFIG
+ *                     fallback used when nothing matches does NOT count as a
+ *                     scheduled practice). That count is the denominator.
+ *                     The numerator is how many of those scheduled dates the
+ *                     employee actually has a punch on. Rate = attended /
+ *                     scheduled practices, as a percentage — arriving late or
+ *                     leaving early doesn't reduce it, only being fully
+ *                     absent on a scheduled day does.
  */
 function handleReport(req) {
   if (!checkReportPassword(req.password)) {
@@ -1281,26 +1291,39 @@ function handleReport(req) {
     perEmployeeDate[code][bDate] = worked.hours;
   });
 
+  // Every active, registered employee matching the filter appears in the
+  // report even with zero punches, so a player who never showed up still
+  // shows as absent (0 hours, 0% attendance) instead of being left out.
+  readTable(SHEETS.EMPLOYEES).rows
+    .filter(r => truthy(r.is_active))
+    .forEach(r => {
+      const code = String(r.employee_code || '').trim();
+      if (!code || !employeeMatches(code)) return;
+      employeeNames[code] = String(r.name);
+      if (!perEmployeeDate[code]) perEmployeeDate[code] = {};
+    });
+
   const employeeCodes = Object.keys(perEmployeeDate).sort();
   if (!employeeCodes.length) {
-    return { ok: false, error: 'NO_DATA', message: 'No matching punches were found for this filter.' };
+    return { ok: false, error: 'NO_DATA', message: 'No matching players were found for this filter.' };
   }
 
-  // Scheduled Hours itself isn't shown in the report — only Total Hours and the
-  // Attendance Rate derived from it — but it's still computed internally since
-  // the rate needs it as a denominator.
   const headerRow = ['Employee'].concat(dates, ['Total Hours', 'Attendance Rate']);
   const dataRows = employeeCodes.map(code => {
     let totalActual = 0;
-    let totalScheduled = 0;
+    let scheduledCount = 0;
+    let attendedCount = 0;
     const perDateCells = dates.map(d => {
       const hrs = perEmployeeDate[code][d] || 0;
       totalActual += hrs;
       const sched = findSchedule(d, code, locFilter);
-      totalScheduled += (sched && isNum(sched.scheduled_hours)) ? Number(sched.scheduled_hours) : 0;
+      if (sched && sched.matched) {
+        scheduledCount++;
+        if (included[d + '|' + code]) attendedCount++;
+      }
       return hrs;
     });
-    const rate = totalScheduled > 0 ? Math.round((totalActual / totalScheduled) * 1000) / 10 + '%' : '';
+    const rate = scheduledCount > 0 ? Math.round((attendedCount / scheduledCount) * 1000) / 10 + '%' : '';
     return [employeeNames[code] || code].concat(
       perDateCells,
       [Math.round(totalActual * 100) / 100, rate]
