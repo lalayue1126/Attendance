@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#16202B">
+<title>Admin</title>
+<style>
+  :root{
+    --ink:#16202B;
+    --ink-soft:#3A4753;
+    --muted:#6B7780;
+    --line:#D8DEDC;
+    --paper:#EFF2F1;
+    --card:#FFFFFF;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:var(--paper);
+    color:var(--ink);
+    font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    font-size:16px;line-height:1.6;
+    min-height:100vh;
+    padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom);
+  }
+  .wrap{max-width:480px;margin:0 auto;padding:24px 16px 40px}
+
+  .band{background:var(--ink);color:#fff;margin:0 -16px 20px;padding:18px 20px 16px}
+  .band .eyebrow{
+    font-family:var(--mono);font-size:12px;letter-spacing:.14em;
+    text-transform:uppercase;color:#8FA2B0;margin:0 0 4px;
+  }
+  .band .title{font-size:21px;font-weight:600;margin:0}
+
+  a.tool-card{
+    display:block;background:var(--card);border:1px solid var(--line);
+    border-radius:10px;padding:18px;margin-bottom:16px;
+    text-decoration:none;color:inherit;
+  }
+  a.tool-card:active{background:var(--paper)}
+  .tool-card h2{font-size:17px;font-weight:600;margin:0 0 6px;color:var(--ink)}
+  .tool-card p{font-size:13.5px;color:var(--muted);margin:0;line-height:1.55}
+  .tool-card .arrow{float:right;color:var(--muted);font-size:20px}
+
+  .note{font-size:13px;color:var(--muted);margin:24px 0 0;line-height:1.55}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="band">
+    <p class="eyebrow">Admin</p>
+    <p class="title">Attendance Admin</p>
+  </div>
+
+  <a class="tool-card" href="report.html">
+    <span class="arrow">›</span>
+    <h2>Attendance Report</h2>
+    <p>View total hours and attendance rate by player, practice location, and date range. Password-protected.</p>
+  </a>
+
+  <a class="tool-card" href="schedule.html">
+    <span class="arrow">›</span>
+    <h2>Add Schedule</h2>
+    <p>Bulk-add practice schedule entries — a date range with weekdays, individual dates, or both. Password-protected.</p>
+  </a>
+
+  <p class="note">Both tools use the same admin password.</p>
+
+</div>
+</body>
+</html>

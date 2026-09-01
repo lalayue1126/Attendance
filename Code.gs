@@ -297,7 +297,7 @@ function handlePunch(req) {
     const now = new Date();
     const bDate = businessDate(now);
     const todaySoFar = getTodayEvents(emp.employee_code, bDate);
-    const schedule = findSchedule(bDate, emp.employee_code, practiceLoc.loc_id);
+    const schedule = findSchedule(bDate, emp.employee_code, practiceLoc.loc_id, now);
     const worked = computeDayWorked(
       schedule, bDate, todaySoFar.concat([{ type: type, punched_at: now }]));
 
@@ -427,7 +427,10 @@ function isValidSchedule(r) {
  * "any location". Different staff at the same location on the same day can
  * therefore have different scheduled hours (per-employee rows), and the same
  * employee can have different hours depending on which location they're
- * checking in at (per-location rows).
+ * checking in at (per-location rows). The same location can also have more
+ * than one session on the same day (e.g. a morning and an evening session at
+ * AQC) — referenceTime (the actual punch time, when known) disambiguates
+ * between them; see below.
  *
  * The most specific match wins, in this order:
  *   1. this employee + this location
@@ -437,14 +440,23 @@ function isValidSchedule(r) {
  * Rows with a blank/invalid start time or hours are skipped in favor of the
  * next candidate. If nothing matches, falls back to the CONFIG default
  * (a safety net).
+ *
+ * When multiple rows tie at the same specificity (e.g. two AQC sessions on
+ * the same day), referenceTime picks whichever session's scheduled_start is
+ * closest to it — otherwise a 05:39 check-in could get matched against an
+ * 18:30 session just because it happens to sort last. Pass the actual punch
+ * time whenever one is available. Only when referenceTime is omitted (e.g.
+ * summing scheduled hours for a whole date range with no single punch to
+ * anchor to) does the tie-break fall back to "the last matching row wins".
  */
-function findSchedule(businessDateStr, employeeCode, practiceLocId) {
+function findSchedule(businessDateStr, employeeCode, practiceLocId, referenceTime) {
   const t = readTable(SHEETS.SCHEDULES);
   const code = String(employeeCode || '').trim().toUpperCase();
   const loc = String(practiceLocId || '').trim().toUpperCase();
 
   let best = null;
   let bestScore = -1;
+  let bestDiff = Infinity;
 
   for (const r of t.rows) {
     if (normalizeDateStr(r.business_date) !== businessDateStr) continue;
@@ -457,9 +469,22 @@ function findSchedule(businessDateStr, employeeCode, practiceLocId) {
     if (rowLoc && rowLoc !== loc) continue; // row is for a different specific location
 
     const score = (rowCode ? 2 : 0) + (rowLoc ? 1 : 0);
-    if (score >= bestScore) { // later rows win ties, so a correction row added below an old one takes over
-      bestScore = score;
-      best = r;
+    if (score < bestScore) continue; // a less specific row never overrides a better one
+
+    let diff = 0;
+    if (referenceTime) {
+      const rowStart = Utilities.parseDate(
+        businessDateStr + ' ' + normalizeTimeStr(r.scheduled_start), CONFIG.TZ, 'yyyy-MM-dd HH:mm');
+      diff = Math.abs(referenceTime.getTime() - rowStart.getTime());
+    }
+
+    if (score > bestScore) {
+      // Strictly more specific — always take it, resetting the time tiebreak.
+      best = r; bestScore = score; bestDiff = diff;
+    } else if (!referenceTime || diff <= bestDiff) {
+      // Equally specific: with a reference time, the closer session wins;
+      // without one, the last matching row wins (old behavior).
+      best = r; bestDiff = diff;
     }
   }
 
@@ -535,15 +560,17 @@ function computeDayWorked(schedule, businessDateStr, events) {
  * dayEvents must contain every non-voided event for this employee on this
  * date, regardless of practice location — all of them are needed to pair
  * Check In / Leave Early correctly. The schedule is looked up against the
- * *last* event's practice location, matching how handlePunch() decides it
- * live (each punch recomputes the whole day using its own location, so
- * whichever punch was most recent is what determines the day's total).
+ * *last* event's practice location and timestamp, matching how handlePunch()
+ * decides it live (each punch recomputes the whole day using its own location
+ * and time, so whichever punch was most recent is what determines the day's
+ * total — the timestamp also disambiguates between multiple same-day sessions
+ * at the same location, e.g. a morning and an evening practice at AQC).
  */
 function recomputeDayWorked(employeeCode, businessDateStr, dayEvents) {
   if (!dayEvents.length) return { hours: 0, minutes: 0 };
   const sorted = dayEvents.slice().sort((a, b) => a.punched_at - b.punched_at);
-  const lastLoc = sorted[sorted.length - 1].practice_loc_id;
-  const schedule = findSchedule(businessDateStr, employeeCode, lastLoc);
+  const lastEvent = sorted[sorted.length - 1];
+  const schedule = findSchedule(businessDateStr, employeeCode, lastEvent.practice_loc_id, lastEvent.punched_at);
   const worked = computeDayWorked(schedule, businessDateStr, sorted);
   return {
     hours: isNum(worked.hours) ? worked.hours : 0,
