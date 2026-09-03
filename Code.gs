@@ -424,7 +424,11 @@ function isValidSchedule(r) {
  * Finds the scheduled hours for a given day, employee, and practice location.
  * employee_code and practice_loc_id are both optional in the schedules sheet —
  * a blank employee_code means "everyone", and a blank practice_loc_id means
- * "any location". Different staff at the same location on the same day can
+ * "any location". Passing '' for practiceLocId means the same thing from the
+ * caller's side — "don't restrict by location" — so a row with a specific
+ * location still matches; this is what handleReport() passes when its own
+ * location filter is left on "All Locations". Different staff at the same
+ * location on the same day can
  * therefore have different scheduled hours (per-employee rows), and the same
  * employee can have different hours depending on which location they're
  * checking in at (per-location rows). The same location can also have more
@@ -466,7 +470,7 @@ function findSchedule(businessDateStr, employeeCode, practiceLocId, referenceTim
     if (rowCode && rowCode !== code) continue; // row is for a different specific employee
 
     const rowLoc = String(r.practice_loc_id || '').trim().toUpperCase();
-    if (rowLoc && rowLoc !== loc) continue; // row is for a different specific location
+    if (loc && rowLoc && rowLoc !== loc) continue; // row is for a different specific location
 
     const score = (rowCode ? 2 : 0) + (rowLoc ? 1 : 0);
     if (score < bestScore) continue; // a less specific row never overrides a better one
@@ -549,6 +553,54 @@ function computeDayWorked(schedule, businessDateStr, events) {
     hours: Math.round(cappedMs / 3600000 * 100) / 100,
     minutes: Math.round(cappedMs / 60000)
   };
+}
+
+/**
+ * Returns the distinct scheduled_start times (zero-padded 'HH:mm', sorted
+ * ascending) for every valid schedule row on this date that matches the
+ * location filter ('' = every location, same "blank row = any location"
+ * rule as findSchedule()). Only used by handleReport() to detect a day with
+ * more than one practice session, so it can split that date into separate
+ * per-session columns instead of merging every session's punches into one.
+ */
+function distinctSessionStarts(businessDateStr, locFilter) {
+  const t = readTable(SHEETS.SCHEDULES);
+  const loc = String(locFilter || '').trim().toUpperCase();
+  const starts = {};
+  t.rows.forEach(r => {
+    if (normalizeDateStr(r.business_date) !== businessDateStr) return;
+    if (!isValidSchedule(r)) return;
+    const rowLoc = String(r.practice_loc_id || '').trim().toUpperCase();
+    if (loc && rowLoc && rowLoc !== loc) return;
+    starts[padTimeStr(r.scheduled_start)] = true;
+  });
+  return Object.keys(starts).sort();
+}
+
+/**
+ * Splits one day's full event list into one sub-list per session, given that
+ * date's sorted session start times. A punch belongs to session i if it's at
+ * or after (start_i minus 30 minutes) and before (start_(i+1) minus 30
+ * minutes) — so with sessions at 09:00 and 15:00, anything from 14:30 onward
+ * counts as the second session, everything earlier as the first. Nothing
+ * before the first session's threshold is dropped; it still lands in
+ * session 0, since there's no earlier session to claim it.
+ */
+function splitBySession(dayEvents, starts, businessDateStr) {
+  const boundaries = starts.map((s, i) => {
+    if (i === 0) return -Infinity;
+    const t = Utilities.parseDate(businessDateStr + ' ' + s, CONFIG.TZ, 'yyyy-MM-dd HH:mm');
+    return t.getTime() - 30 * 60000;
+  });
+  const buckets = starts.map(() => []);
+  dayEvents.forEach(ev => {
+    let idx = 0;
+    for (let i = 0; i < boundaries.length; i++) {
+      if (ev.punched_at.getTime() >= boundaries[i]) idx = i;
+    }
+    buckets[idx].push(ev);
+  });
+  return buckets;
 }
 
 /**
@@ -716,6 +768,13 @@ function normalizeDateStr(v) {
 function normalizeTimeStr(v) {
   if (v instanceof Date) return Utilities.formatDate(v, CONFIG.TZ, 'HH:mm');
   return String(v || '').trim();
+}
+
+/** Zero-pads a time string to 'HH:mm' (e.g. "9:30" -> "09:30") so it sorts correctly as plain text. */
+function padTimeStr(v) {
+  const s = normalizeTimeStr(v);
+  const m = s.match(/^(\d{1,2}):(\d{2})$/);
+  return m ? m[1].padStart(2, '0') + ':' + m[2] : s;
 }
 
 /** Distance between two points, in meters. */
@@ -1177,34 +1236,45 @@ function handleReportMeta(req) {
  * one with zero punches in the whole range — a player who never checked in
  * shows up as 0 hours / 0% rather than being silently omitted.
  *
- * Layout: one row per employee, one column per date in the range, plus
- * Total Hours / Attendance Rate columns. Every date column and Total Hours
- * are formatted to always show 2 decimal places (e.g. "3.00"), since that's
- * precise enough to distinguish individual minutes.
- *   - Total Hours   : for each day the employee is included (see below),
- *                     recomputeDayWorked() recalculates that day's hours
- *                     from the raw punch_events rows and whatever is
- *                     CURRENTLY in the schedules sheet — never the
- *                     worked_hours snapshot stored on the row itself — so a
- *                     schedule correction made after the fact is reflected
- *                     the next time the report is generated. A day counts
- *                     as included if the employee has at least one non-voided
- *                     punch that day matching the location filter (if any);
- *                     once included, ALL of that day's punches (at any
- *                     location) feed into the hours calculation, matching
- *                     how a single day's total has always been computed.
- *   - Attendance Rate: count-based, not hours-based. For every date in the
- *                     range, findSchedule() (same employee/location priority
- *                     rules as the live worked-hours calculation) checks
+ * Layout: one row per employee, one column per *session* in the range, plus
+ * Total Hours / Attendance Rate columns. Every session column and Total
+ * Hours are formatted to always show 2 decimal places (e.g. "3.00"), since
+ * that's precise enough to distinguish individual minutes.
+ *
+ * A date normally gets one column, labeled with just the date. But if
+ * distinctSessionStarts() finds 2+ distinct scheduled_start times on that
+ * date (matching the location filter) — e.g. a morning and an evening
+ * practice — it becomes multiple columns instead, labeled "yyyy-MM-dd(1)",
+ * "yyyy-MM-dd(2)", etc. in start-time order. splitBySession() assigns each
+ * punch to a column using a 30-minutes-before-start threshold: a punch
+ * counts toward session N once it's within 30 minutes of session N's start
+ * (and not yet within 30 minutes of session N+1's start). This keeps a
+ * double-practice day from having one session's hours silently swallowed
+ * into the other's schedule window, which is what happened when the whole
+ * day shared a single schedule for clipping.
+ *   - Total Hours   : for each session column, that session's own punches
+ *                     (see splitBySession() above) are clipped against that
+ *                     session's own schedule row — via findSchedule() /
+ *                     computeDayWorked(), never the worked_hours snapshot
+ *                     stored on the row itself — so a schedule correction
+ *                     made after the fact is reflected the next time the
+ *                     report is generated. A column only shows hours if the
+ *                     employee has at least one non-voided punch in that
+ *                     session matching the location filter (if any).
+ *   - Attendance Rate: count-based, not hours-based. For every session
+ *                     column, findSchedule() (same employee/location
+ *                     priority rules as the live worked-hours calculation,
+ *                     anchored to that session's own start time) checks
  *                     whether an actual practice was scheduled for that
- *                     employee that day (schedule.matched — the CONFIG
- *                     fallback used when nothing matches does NOT count as a
- *                     scheduled practice). That count is the denominator.
- *                     The numerator is how many of those scheduled dates the
- *                     employee actually has a punch on. Rate = attended /
- *                     scheduled practices, as a percentage — arriving late or
- *                     leaving early doesn't reduce it, only being fully
- *                     absent on a scheduled day does.
+ *                     employee in that session (schedule.matched — the
+ *                     CONFIG fallback used when nothing matches does NOT
+ *                     count as a scheduled practice). That count is the
+ *                     denominator. The numerator is how many of those
+ *                     scheduled sessions the employee actually has a punch
+ *                     in. Rate = attended / scheduled sessions, as a
+ *                     percentage — arriving late or leaving early doesn't
+ *                     reduce it, only being fully absent from a scheduled
+ *                     session does.
  */
 function handleReport(req) {
   if (!checkReportPassword(req.password)) {
@@ -1248,12 +1318,9 @@ function handleReport(req) {
 
   // Pass 1: collect every non-voided event in range, grouped by (date, employee),
   // regardless of the location filter — pairing Check In / Leave Early correctly
-  // requires seeing the whole day. Separately, mark which (date, employee) keys
-  // actually match the filters ("included") so the location filter only decides
-  // which days show up in the report, not which of that day's punches count.
+  // requires seeing the whole day.
   const eventsByDayEmployee = {}; // 'date|code' -> [{type, punched_at, practice_loc_id}]
   const employeeNames = {};       // employee_code -> name
-  const included = {};            // 'date|code' -> true
 
   if (lastRow >= 2) {
     const values = t.sheet.getRange(2, 1, lastRow - 1, t.headers.length).getValues();
@@ -1273,22 +1340,61 @@ function handleReport(req) {
         punched_at: new Date(r[t.col.punched_at]),
         practice_loc_id: String(r[t.col.practice_loc_id] || '')
       });
-
-      if (!employeeMatches(code)) return;
-      if (locFilter && String(r[t.col.practice_loc_id]).trim() !== locFilter) return;
-      included[key] = true;
     });
   }
 
-  // Pass 2: recompute hours only for included days, from that day's full event list.
-  const perEmployeeDate = {}; // employee_code -> { business_date -> worked_hours }
-  Object.keys(included).forEach(key => {
+  // Pass 2: build the column list — one per date normally, or one per
+  // session (see distinctSessionStarts()) on a date with 2+ practices.
+  const columns = []; // [{label, date, sessionStart}] — sessionStart is null for a single-session date
+  dates.forEach(d => {
+    const starts = distinctSessionStarts(d, locFilter);
+    if (starts.length <= 1) {
+      columns.push({ label: d, date: d, sessionStart: null });
+    } else {
+      starts.forEach((s, i) => columns.push({ label: d + '(' + (i + 1) + ')', date: d, sessionStart: s }));
+    }
+  });
+
+  // Pass 3: recompute hours + attendance per (column, employee), from that
+  // column's own slice of the day's events. A column only gets an entry —
+  // and only then counts toward attendance — if at least one of its punches
+  // matches the location filter (if any); this mirrors how a location
+  // filter has always worked, so a player who trained only at some other
+  // location that day still shows 0 for this location's report instead of
+  // an unrelated location's hours leaking in.
+  const perEmployeeCol = {}; // employee_code -> { column_label -> worked_hours }
+  const colIncluded = {};    // 'column_label|code' -> true
+
+  function matchesLocFilter(evts) {
+    return locFilter ? evts.some(ev => ev.practice_loc_id === locFilter) : evts.length > 0;
+  }
+
+  Object.keys(eventsByDayEmployee).forEach(key => {
     const sep = key.indexOf('|');
-    const bDate = key.slice(0, sep);
+    const d = key.slice(0, sep);
     const code = key.slice(sep + 1);
-    const worked = recomputeDayWorked(code, bDate, eventsByDayEmployee[key]);
-    if (!perEmployeeDate[code]) perEmployeeDate[code] = {};
-    perEmployeeDate[code][bDate] = worked.hours;
+    if (!employeeMatches(code)) return;
+    const dayEvents = eventsByDayEmployee[key];
+    if (!perEmployeeCol[code]) perEmployeeCol[code] = {};
+
+    const starts = distinctSessionStarts(d, locFilter);
+    if (starts.length <= 1) {
+      if (!matchesLocFilter(dayEvents)) return;
+      const worked = recomputeDayWorked(code, d, dayEvents);
+      perEmployeeCol[code][d] = isNum(worked.hours) ? Number(worked.hours) : 0;
+      colIncluded[d + '|' + code] = true;
+    } else {
+      const buckets = splitBySession(dayEvents, starts, d);
+      buckets.forEach((bucketEvents, i) => {
+        if (!matchesLocFilter(bucketEvents)) return;
+        const label = d + '(' + (i + 1) + ')';
+        const sessionStart = Utilities.parseDate(d + ' ' + starts[i], CONFIG.TZ, 'yyyy-MM-dd HH:mm');
+        const schedule = findSchedule(d, code, locFilter, sessionStart);
+        const worked = computeDayWorked(schedule, d, bucketEvents);
+        perEmployeeCol[code][label] = isNum(worked.hours) ? Number(worked.hours) : 0;
+        colIncluded[label + '|' + code] = true;
+      });
+    }
   });
 
   // Every active, registered employee matching the filter appears in the
@@ -1300,32 +1406,35 @@ function handleReport(req) {
       const code = String(r.employee_code || '').trim();
       if (!code || !employeeMatches(code)) return;
       employeeNames[code] = String(r.name);
-      if (!perEmployeeDate[code]) perEmployeeDate[code] = {};
+      if (!perEmployeeCol[code]) perEmployeeCol[code] = {};
     });
 
-  const employeeCodes = Object.keys(perEmployeeDate).sort();
+  const employeeCodes = Object.keys(perEmployeeCol).sort();
   if (!employeeCodes.length) {
     return { ok: false, error: 'NO_DATA', message: 'No matching players were found for this filter.' };
   }
 
-  const headerRow = ['Employee'].concat(dates, ['Total Hours', 'Attendance Rate']);
+  const headerRow = ['Employee'].concat(columns.map(c => c.label), ['Total Hours', 'Attendance Rate']);
   const dataRows = employeeCodes.map(code => {
     let totalActual = 0;
     let scheduledCount = 0;
     let attendedCount = 0;
-    const perDateCells = dates.map(d => {
-      const hrs = perEmployeeDate[code][d] || 0;
+    const cells = columns.map(c => {
+      const hrs = (perEmployeeCol[code] && perEmployeeCol[code][c.label]) || 0;
       totalActual += hrs;
-      const sched = findSchedule(d, code, locFilter);
+
+      const sched = c.sessionStart
+        ? findSchedule(c.date, code, locFilter, Utilities.parseDate(c.date + ' ' + c.sessionStart, CONFIG.TZ, 'yyyy-MM-dd HH:mm'))
+        : findSchedule(c.date, code, locFilter);
       if (sched && sched.matched) {
         scheduledCount++;
-        if (included[d + '|' + code]) attendedCount++;
+        if (colIncluded[c.label + '|' + code]) attendedCount++;
       }
       return hrs;
     });
     const rate = scheduledCount > 0 ? Math.round((attendedCount / scheduledCount) * 1000) / 10 + '%' : '';
     return [employeeNames[code] || code].concat(
-      perDateCells,
+      cells,
       [Math.round(totalActual * 100) / 100, rate]
     );
   });
@@ -1348,10 +1457,10 @@ function handleReport(req) {
   sh.getRange(2, 1, 1, headerRow.length).setFontWeight('bold');
   if (dataRows.length) {
     sh.getRange(3, 1, dataRows.length, headerRow.length).setValues(dataRows);
-    // Force every date column plus Total Hours to always show 2 decimal
+    // Force every session column plus Total Hours to always show 2 decimal
     // places (e.g. "3.00" instead of "3"), so partial-hour/minute detail
     // is visible even for whole-hour totals.
-    const hourColumns = dates.length + 1; // each date column + Total Hours
+    const hourColumns = columns.length + 1; // each session column + Total Hours
     sh.getRange(3, 2, dataRows.length, hourColumns).setNumberFormat('0.00');
   }
   sh.setFrozenRows(2);
@@ -1489,16 +1598,10 @@ function sortSchedulesSheet() {
   const t = readTable(SHEETS.SCHEDULES);
   if (!t.rows.length) return;
 
-  const padTime = v => {
-    const s = normalizeTimeStr(v);
-    const m = s.match(/^(\d{1,2}):(\d{2})$/);
-    return m ? m[1].padStart(2, '0') + ':' + m[2] : s;
-  };
-
   const rows = t.rows.map(r => {
     const copy = Object.assign({}, r);
     copy.business_date = normalizeDateStr(r.business_date);
-    copy.scheduled_start = padTime(r.scheduled_start);
+    copy.scheduled_start = padTimeStr(r.scheduled_start);
     return copy;
   });
   rows.sort((a, b) => {
