@@ -108,6 +108,29 @@ function categoryForEmployee(employeeCode) {
   return SCHEDULE_CATEGORIES.indexOf(c) !== -1 ? c : '';
 }
 
+// findSchedule() and distinctSessionStarts() both re-read a whole schedule
+// sheet on every call; handleReport() calls them per (date, employee)
+// column, which for a wide date range × the full roster is thousands of
+// calls — enough repeated full-sheet reads to blow past the frontend's
+// fetch timeout even though the report finishes and gets written. This
+// caches each schedule sheet's contents for the lifetime of one request, so
+// each sheet is actually read from Sheets at most once. resetScheduleCache()
+// is called at the top of doPost() so a warm Apps Script execution context
+// never serves another request's stale copy.
+let _scheduleTableCache = null;
+
+function resetScheduleCache() {
+  _scheduleTableCache = {};
+}
+
+function getScheduleTable(sheetName) {
+  if (!_scheduleTableCache) _scheduleTableCache = {};
+  if (!_scheduleTableCache[sheetName]) {
+    _scheduleTableCache[sheetName] = readTable(sheetName);
+  }
+  return _scheduleTableCache[sheetName];
+}
+
 const MODE_LABEL = {
   FIXED: 'Fixed', PORTABLE: 'Portable'
 };
@@ -118,6 +141,7 @@ const MODE_LABEL = {
    ════════════════════════════════════════════ */
 
 function doPost(e) {
+  resetScheduleCache();
   try {
     if (!e || !e.postData || !e.postData.contents) {
       return json({ ok: false, error: 'BAD_REQUEST', message: 'The request was empty.' });
@@ -452,10 +476,9 @@ function isValidSchedule(r) {
  * optional — a blank employee_code means "everyone in this category", and a
  * blank practice_loc_id means "any location". Passing '' for practiceLocId
  * means the same thing from the caller's side — "don't restrict by
- * location" — so a row with a specific location still matches; this is what
- * handleReport() passes when its own location filter is left on "All
- * Locations". Different players in the same category can therefore have
- * different scheduled hours (per-employee rows), and the same employee can
+ * location" — so a row with a specific location still matches; handleReport()
+ * always calls with '' since it has no location filter of its own. Different
+ * players in the same category can therefore have
  * have different hours depending on which location they're checking in at
  * (per-location rows). The same location can also have more than one
  * session on the same day (e.g. a morning and an evening session at AQC) —
@@ -492,7 +515,7 @@ function findSchedule(businessDateStr, employeeCode, practiceLocId, referenceTim
     };
   }
 
-  const t = readTable(scheduleSheetName(category));
+  const t = getScheduleTable(scheduleSheetName(category));
   const code = String(employeeCode || '').trim().toUpperCase();
   const loc = String(practiceLocId || '').trim().toUpperCase();
 
@@ -595,25 +618,20 @@ function computeDayWorked(schedule, businessDateStr, events) {
 
 /**
  * Returns the distinct scheduled_start times (zero-padded 'HH:mm', sorted
- * ascending) across the given categories' schedule sheets for this date,
- * matching the location filter ('' = every location, same "blank row = any
- * location" rule as findSchedule()). An empty result means no practice was
- * scheduled that day for any of these categories — handleReport() uses that
- * to drop the date from the report entirely, and a non-empty result to
- * detect a day with more than one session so it can split that date into
- * separate per-session columns instead of merging every session's punches
- * into one.
+ * ascending) across the given categories' schedule sheets for this date. An
+ * empty result means no practice was scheduled that day for any of these
+ * categories — handleReport() uses that to drop the date from the report
+ * entirely, and a non-empty result to detect a day with more than one
+ * session so it can split that date into separate per-session columns
+ * instead of merging every session's punches into one.
  */
-function distinctSessionStarts(businessDateStr, locFilter, categories) {
-  const loc = String(locFilter || '').trim().toUpperCase();
+function distinctSessionStarts(businessDateStr, categories) {
   const starts = {};
   categories.forEach(cat => {
-    const t = readTable(scheduleSheetName(cat));
+    const t = getScheduleTable(scheduleSheetName(cat));
     t.rows.forEach(r => {
       if (normalizeDateStr(r.business_date) !== businessDateStr) return;
       if (!isValidSchedule(r)) return;
-      const rowLoc = String(r.practice_loc_id || '').trim().toUpperCase();
-      if (loc && rowLoc && rowLoc !== loc) return;
       starts[padTimeStr(r.scheduled_start)] = true;
     });
   });
@@ -1120,6 +1138,7 @@ function voidEvent() {
  *   replaced, never duplicated).
  */
 function buildWeeklySummary() {
+  resetScheduleCache(); // avoid a warm execution context serving another run's stale schedule reads
   const today = businessDate(new Date());
   const thisMonday = mondayOfWeek(today);
   const weekStart = addDays(thisMonday, -7); // last week's Monday
@@ -1248,30 +1267,25 @@ function checkReportPassword(pw) {
 }
 
 /**
- * Returns the filter options (practice locations, employees) for the report
- * screen's dropdowns. Requires the report password — this is the only data
- * report.html can see before authenticating.
+ * Returns the filter options (employees) for the report screen's dropdowns.
+ * Requires the report password — this is the only data report.html can see
+ * before authenticating.
  */
 function handleReportMeta(req) {
   if (!checkReportPassword(req.password)) {
     return { ok: false, error: 'BAD_PASSWORD', message: 'Incorrect password.' };
   }
 
-  const locations = readTable(SHEETS.LOCATIONS).rows
-    .filter(r => truthy(r.is_active))
-    .map(r => ({ id: String(r.loc_id), label: String(r.name) + ' (' + String(r.type) + ')' }));
-
   const employees = readTable(SHEETS.EMPLOYEES).rows
     .filter(r => truthy(r.is_active))
     .map(r => ({ code: String(r.employee_code), name: String(r.name) }));
 
-  return { ok: true, locations: locations, employees: employees };
+  return { ok: true, employees: employees };
 }
 
 /**
  * Builds the attendance report for a date range and writes it to the
  * "report" sheet, overwriting whatever was there before. Filters:
- *   - practice_loc_id   : single location id, or '' for all locations.
  *   - employee_codes    : array of specific employee codes to include.
  *   - employee_prefixes : array of single letters (e.g. 'E'); every employee
  *                         whose code starts with one of them is included.
@@ -1294,15 +1308,15 @@ function handleReportMeta(req) {
  *
  * Otherwise a date normally gets one column, labeled with just the date.
  * But if distinctSessionStarts() finds 2+ distinct scheduled_start times on
- * that date (matching the location filter) — e.g. a morning and an evening
- * practice — it becomes multiple columns instead, labeled "yyyy-MM-dd(1)",
- * "yyyy-MM-dd(2)", etc. in start-time order. splitBySession() assigns each
- * punch to a column using a 30-minutes-before-start threshold: a punch
- * counts toward session N once it's within 30 minutes of session N's start
- * (and not yet within 30 minutes of session N+1's start). This keeps a
- * double-practice day from having one session's hours silently swallowed
- * into the other's schedule window, which is what happened when the whole
- * day shared a single schedule for clipping.
+ * that date — e.g. a morning and an evening practice — it becomes multiple
+ * columns instead, labeled "yyyy-MM-dd(1)", "yyyy-MM-dd(2)", etc. in
+ * start-time order. splitBySession() assigns each punch to a column using a
+ * 30-minutes-before-start threshold: a punch counts toward session N once
+ * it's within 30 minutes of session N's start (and not yet within 30
+ * minutes of session N+1's start). This keeps a double-practice day from
+ * having one session's hours silently swallowed into the other's schedule
+ * window, which is what happened when the whole day shared a single
+ * schedule for clipping.
  *   - Total Hours   : for each session column, that session's own punches
  *                     (see splitBySession() above) are clipped against that
  *                     session's own schedule row — via findSchedule() /
@@ -1311,7 +1325,7 @@ function handleReportMeta(req) {
  *                     made after the fact is reflected the next time the
  *                     report is generated. A column only shows hours if the
  *                     employee has at least one non-voided punch in that
- *                     session matching the location filter (if any).
+ *                     session.
  *   - Attendance Rate: count-based, not hours-based. For every session
  *                     column, findSchedule() (same employee/location
  *                     priority rules as the live worked-hours calculation,
@@ -1345,8 +1359,6 @@ function handleReport(req) {
       return { ok: false, error: 'RANGE_TOO_LARGE', message: 'Please select a range of 366 days or fewer.' };
     }
   }
-
-  const locFilter = String(req.practice_loc_id || '').trim();       // '' = all locations
 
   // Employees can be picked individually (employee_codes) and/or by the
   // first letter of their code (employee_prefixes, e.g. 'E' for E001/E002/...).
@@ -1412,7 +1424,7 @@ function handleReport(req) {
   // entirely — an unscheduled day has no business appearing in the report.
   const columns = []; // [{label, date, sessionStart}] — sessionStart is null for a single-session date
   dates.forEach(d => {
-    const starts = distinctSessionStarts(d, locFilter, categories);
+    const starts = distinctSessionStarts(d, categories);
     if (starts.length === 0) return;
     if (starts.length === 1) {
       columns.push({ label: d, date: d, sessionStart: null });
@@ -1422,18 +1434,9 @@ function handleReport(req) {
   });
 
   // Pass 3: recompute hours + attendance per (column, employee), from that
-  // column's own slice of the day's events. A column only gets an entry —
-  // and only then counts toward attendance — if at least one of its punches
-  // matches the location filter (if any); this mirrors how a location
-  // filter has always worked, so a player who trained only at some other
-  // location that day still shows 0 for this location's report instead of
-  // an unrelated location's hours leaking in.
+  // column's own slice of the day's events.
   const perEmployeeCol = {}; // employee_code -> { column_label -> worked_hours }
   const colIncluded = {};    // 'column_label|code' -> true
-
-  function matchesLocFilter(evts) {
-    return locFilter ? evts.some(ev => ev.practice_loc_id === locFilter) : evts.length > 0;
-  }
 
   Object.keys(eventsByDayEmployee).forEach(key => {
     const sep = key.indexOf('|');
@@ -1443,20 +1446,19 @@ function handleReport(req) {
     const dayEvents = eventsByDayEmployee[key];
     if (!perEmployeeCol[code]) perEmployeeCol[code] = {};
 
-    const starts = distinctSessionStarts(d, locFilter, categories);
+    const starts = distinctSessionStarts(d, categories);
     if (starts.length === 0) return; // no practice scheduled that day — dropped from columns, so skip
     if (starts.length === 1) {
-      if (!matchesLocFilter(dayEvents)) return;
       const worked = recomputeDayWorked(code, d, dayEvents);
       perEmployeeCol[code][d] = isNum(worked.hours) ? Number(worked.hours) : 0;
       colIncluded[d + '|' + code] = true;
     } else {
       const buckets = splitBySession(dayEvents, starts, d);
       buckets.forEach((bucketEvents, i) => {
-        if (!matchesLocFilter(bucketEvents)) return;
+        if (!bucketEvents.length) return;
         const label = d + '(' + (i + 1) + ')';
         const sessionStart = Utilities.parseDate(d + ' ' + starts[i], CONFIG.TZ, 'yyyy-MM-dd HH:mm');
-        const schedule = findSchedule(d, code, locFilter, sessionStart);
+        const schedule = findSchedule(d, code, '', sessionStart);
         const worked = computeDayWorked(schedule, d, bucketEvents);
         perEmployeeCol[code][label] = isNum(worked.hours) ? Number(worked.hours) : 0;
         colIncluded[label + '|' + code] = true;
@@ -1491,8 +1493,8 @@ function handleReport(req) {
       totalActual += hrs;
 
       const sched = c.sessionStart
-        ? findSchedule(c.date, code, locFilter, Utilities.parseDate(c.date + ' ' + c.sessionStart, CONFIG.TZ, 'yyyy-MM-dd HH:mm'))
-        : findSchedule(c.date, code, locFilter);
+        ? findSchedule(c.date, code, '', Utilities.parseDate(c.date + ' ' + c.sessionStart, CONFIG.TZ, 'yyyy-MM-dd HH:mm'))
+        : findSchedule(c.date, code, '');
       if (sched && sched.matched) {
         scheduledCount++;
         if (colIncluded[c.label + '|' + code]) attendedCount++;
@@ -1516,8 +1518,7 @@ function handleReport(req) {
   if (!sh) sh = ss.insertSheet('report');
   sh.clear();
 
-  const title = 'Attendance Report — ' + (locFilter || 'All locations') + ' — ' +
-                empDesc + ' — ' + startDate + ' to ' + endDate +
+  const title = 'Attendance Report — ' + empDesc + ' — ' + startDate + ' to ' + endDate +
                 ' (generated ' + Utilities.formatDate(new Date(), CONFIG.TZ, 'yyyy-MM-dd HH:mm') + ')';
   sh.getRange(1, 1).setValue(title);
   sh.getRange(2, 1, 1, headerRow.length).setValues([headerRow]);

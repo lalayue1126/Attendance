@@ -117,13 +117,6 @@
     <div id="form-msg"></div>
 
     <div class="field">
-      <label for="f-location">Practice Location (category)</label>
-      <select id="f-location">
-        <option value="">All locations</option>
-      </select>
-    </div>
-
-    <div class="field">
       <label>Players</label>
       <p class="note" style="margin:0 0 8px">
         Leave everything below unchecked/unselected for all players.
@@ -217,7 +210,6 @@ async function unlock(){
       return setMsg($('lock-msg'), m[r.error] || r.message || 'Something went wrong.');
     }
     state.password = pw;
-    populateSelect('f-location', r.locations, l => [l.id, l.label], true);
     renderPlayerGroups(r.employees);
 
     const today = new Date();
@@ -232,20 +224,6 @@ async function unlock(){
   } finally {
     btn.disabled = false; btn.textContent = 'Unlock';
   }
-}
-
-function populateSelect(id, items, mapFn, keepFirst){
-  const sel = $(id);
-  const first = keepFirst ? sel.querySelector('option') : null;
-  sel.innerHTML = '';
-  if (first) sel.appendChild(first);
-  items.forEach(item => {
-    const [value, label] = mapFn(item);
-    const opt = document.createElement('option');
-    opt.value = value;
-    opt.textContent = label;
-    sel.appendChild(opt);
-  });
 }
 
 /* ── Player groups: one per first letter of the player code (E/N/Y/S/…),
@@ -342,7 +320,6 @@ async function generate(){
     const r = await api({
       action: 'report',
       password: state.password,
-      practice_loc_id: $('f-location').value,
       employee_codes: emp.codes,
       employee_prefixes: emp.prefixes,
       start_date: start,
