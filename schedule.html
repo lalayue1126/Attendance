@@ -132,7 +132,19 @@
 
   <!-- Step 2: form -->
   <section id="scr-form" class="card hide">
-    <h2>When does this apply?</h2>
+    <h2>Which category</h2>
+    <p class="note">
+      Schedules are kept separately per category, since each can now
+      practice at different times/places on the same date.
+    </p>
+    <div class="field">
+      <label for="f-category">Category</label>
+      <select id="f-category">
+        <option value="">Choose a category…</option>
+      </select>
+    </div>
+
+    <h2 style="margin-top:20px">When does this apply?</h2>
     <div id="form-msg"></div>
 
     <div class="row">
@@ -191,8 +203,8 @@
     </div>
 
     <div class="field">
-      <label for="f-player">Player code (leave blank for everyone)</label>
-      <input id="f-player" type="text" placeholder="e.g. E001">
+      <label for="f-player">Player code (leave blank for everyone in this category)</label>
+      <input id="f-player" type="text" placeholder="e.g. A001">
     </div>
 
     <div class="field">
@@ -317,6 +329,7 @@ async function unlock(){
     }
     state.password = pw;
     populateLocations(r.locations);
+    populateCategories(r.categories);
 
     const today = new Date();
     const p = n => String(n).padStart(2,'0');
@@ -345,8 +358,24 @@ function populateLocations(locations){
   });
 }
 
+function populateCategories(categories){
+  const sel = $('f-category');
+  const first = sel.querySelector('option');
+  sel.innerHTML = '';
+  sel.appendChild(first);
+  categories.forEach(cat => {
+    const opt = document.createElement('option');
+    opt.value = cat.id;
+    opt.textContent = cat.label;
+    sel.appendChild(opt);
+  });
+}
+
 /* ── Step 2: add ───────────────────── */
 async function addSchedule(){
+  const category = $('f-category').value;
+  if (!category) return setMsg($('form-msg'), 'Please choose a category.');
+
   const start = $('f-start').value;
   const end = $('f-end').value;
   const usingRange = start || end || state.selectedWeekdays.size;
@@ -374,6 +403,7 @@ async function addSchedule(){
     const r = await api({
       action: 'add_schedule',
       password: state.password,
+      category: category,
       start_date: start,
       end_date: end,
       weekdays: Array.from(state.selectedWeekdays),
@@ -388,6 +418,7 @@ async function addSchedule(){
     if (!r.ok){
       const m = {
         BAD_PASSWORD: 'Incorrect password — please lock and unlock again.',
+        BAD_CATEGORY: 'Please choose a category.',
         BAD_RANGE: 'Please select a valid date range.',
         NO_WEEKDAYS: 'Please select at least one day of the week.',
         BAD_SCHEDULE: 'Please enter a valid start time and number of hours.',

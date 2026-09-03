@@ -42,11 +42,12 @@
  *  【Admin-only pages (both on GitHub Pages, both password-protected)】
  *   report.html   — builds a pivot report (employees × dates) and writes
  *                    it into the "report" sheet.
- *   schedule.html — bulk-adds schedules rows: pick a date range + which
- *                    weekdays practice falls on, plus the (usually fixed)
- *                    start time / hours / location, and it creates one row
- *                    per matching date. Keeps the schedules sheet sorted
- *                    by date automatically (sortSchedulesSheet()).
+ *   schedule.html — bulk-adds rows to one category's schedule sheet
+ *                    (schedule_A/S/N/Y — see SCHEDULE_CATEGORY_LABELS): pick
+ *                    a date range + which weekdays practice falls on, plus
+ *                    the (usually fixed) start time / hours / location, and
+ *                    it creates one row per matching date. Keeps that sheet
+ *                    sorted by date automatically (sortScheduleSheetByName()).
  * ══════════════════════════════════════════════════════════════
  */
 
@@ -79,13 +80,33 @@ const SHEETS = {
   LOCATIONS: 'locations',
   EVENTS: 'punch_events',
   CORRECTIONS: 'corrections',
-  SCHEDULES: 'schedules',
+  SCHEDULES_LEGACY: 'schedules', // pre-category-split sheet, kept only for migrateSchedulesToCategories()
   WEEKLY_SUMMARY: 'weekly_summary'
 };
 
 const TYPE_LABEL = {
   IN: 'Check In', OUT: 'Leave Early'
 };
+
+// Schedules are split one sheet per player category, since different
+// categories can now practice at different times/places on the same date.
+// The category is derived from the first letter of the employee_code (e.g.
+// A003 → 'A'); a code whose first letter isn't one of these (e.g. E-prefix
+// staff) has no schedule sheet of its own, so findSchedule() always falls
+// back to the CONFIG default for them (matched:false — never a "scheduled
+// practice" for attendance-rate purposes).
+const SCHEDULE_CATEGORY_LABELS = { A: 'National A', S: 'Sparring', N: 'National Service', Y: 'NYDS' };
+const SCHEDULE_CATEGORIES = Object.keys(SCHEDULE_CATEGORY_LABELS); // ['A','S','N','Y']
+
+function scheduleSheetName(category) {
+  return 'schedule_' + category;
+}
+
+/** Maps an employee code to its schedule category ('A'/'S'/'N'/'Y'), or '' if it doesn't have one. */
+function categoryForEmployee(employeeCode) {
+  const c = String(employeeCode || '').trim().toUpperCase().charAt(0);
+  return SCHEDULE_CATEGORIES.indexOf(c) !== -1 ? c : '';
+}
 
 const MODE_LABEL = {
   FIXED: 'Fixed', PORTABLE: 'Portable'
@@ -422,19 +443,24 @@ function isValidSchedule(r) {
 
 /**
  * Finds the scheduled hours for a given day, employee, and practice location.
- * employee_code and practice_loc_id are both optional in the schedules sheet —
- * a blank employee_code means "everyone", and a blank practice_loc_id means
- * "any location". Passing '' for practiceLocId means the same thing from the
- * caller's side — "don't restrict by location" — so a row with a specific
- * location still matches; this is what handleReport() passes when its own
- * location filter is left on "All Locations". Different staff at the same
- * location on the same day can
- * therefore have different scheduled hours (per-employee rows), and the same
- * employee can have different hours depending on which location they're
- * checking in at (per-location rows). The same location can also have more
- * than one session on the same day (e.g. a morning and an evening session at
- * AQC) — referenceTime (the actual punch time, when known) disambiguates
- * between them; see below.
+ * Schedules live one sheet per category (schedule_A/S/N/Y — see
+ * categoryForEmployee()); an employee whose code doesn't map to one of those
+ * categories (e.g. E-prefix staff) has no schedule sheet at all, so this
+ * always falls straight to the CONFIG default (matched:false) for them.
+ *
+ * Within that category's sheet, employee_code and practice_loc_id are both
+ * optional — a blank employee_code means "everyone in this category", and a
+ * blank practice_loc_id means "any location". Passing '' for practiceLocId
+ * means the same thing from the caller's side — "don't restrict by
+ * location" — so a row with a specific location still matches; this is what
+ * handleReport() passes when its own location filter is left on "All
+ * Locations". Different players in the same category can therefore have
+ * different scheduled hours (per-employee rows), and the same employee can
+ * have different hours depending on which location they're checking in at
+ * (per-location rows). The same location can also have more than one
+ * session on the same day (e.g. a morning and an evening session at AQC) —
+ * referenceTime (the actual punch time, when known) disambiguates between
+ * them; see below.
  *
  * The most specific match wins, in this order:
  *   1. this employee + this location
@@ -454,7 +480,19 @@ function isValidSchedule(r) {
  * anchor to) does the tie-break fall back to "the last matching row wins".
  */
 function findSchedule(businessDateStr, employeeCode, practiceLocId, referenceTime) {
-  const t = readTable(SHEETS.SCHEDULES);
+  const category = categoryForEmployee(employeeCode);
+  if (!category) {
+    return {
+      business_date: businessDateStr,
+      employee_code: '',
+      practice_loc_id: '',
+      scheduled_start: CONFIG.DEFAULT_SCHEDULED_START,
+      scheduled_hours: CONFIG.DEFAULT_SCHEDULED_HOURS,
+      matched: false
+    };
+  }
+
+  const t = readTable(scheduleSheetName(category));
   const code = String(employeeCode || '').trim().toUpperCase();
   const loc = String(practiceLocId || '').trim().toUpperCase();
 
@@ -557,22 +595,27 @@ function computeDayWorked(schedule, businessDateStr, events) {
 
 /**
  * Returns the distinct scheduled_start times (zero-padded 'HH:mm', sorted
- * ascending) for every valid schedule row on this date that matches the
- * location filter ('' = every location, same "blank row = any location"
- * rule as findSchedule()). Only used by handleReport() to detect a day with
- * more than one practice session, so it can split that date into separate
- * per-session columns instead of merging every session's punches into one.
+ * ascending) across the given categories' schedule sheets for this date,
+ * matching the location filter ('' = every location, same "blank row = any
+ * location" rule as findSchedule()). An empty result means no practice was
+ * scheduled that day for any of these categories — handleReport() uses that
+ * to drop the date from the report entirely, and a non-empty result to
+ * detect a day with more than one session so it can split that date into
+ * separate per-session columns instead of merging every session's punches
+ * into one.
  */
-function distinctSessionStarts(businessDateStr, locFilter) {
-  const t = readTable(SHEETS.SCHEDULES);
+function distinctSessionStarts(businessDateStr, locFilter, categories) {
   const loc = String(locFilter || '').trim().toUpperCase();
   const starts = {};
-  t.rows.forEach(r => {
-    if (normalizeDateStr(r.business_date) !== businessDateStr) return;
-    if (!isValidSchedule(r)) return;
-    const rowLoc = String(r.practice_loc_id || '').trim().toUpperCase();
-    if (loc && rowLoc && rowLoc !== loc) return;
-    starts[padTimeStr(r.scheduled_start)] = true;
+  categories.forEach(cat => {
+    const t = readTable(scheduleSheetName(cat));
+    t.rows.forEach(r => {
+      if (normalizeDateStr(r.business_date) !== businessDateStr) return;
+      if (!isValidSchedule(r)) return;
+      const rowLoc = String(r.practice_loc_id || '').trim().toUpperCase();
+      if (loc && rowLoc && rowLoc !== loc) return;
+      starts[padTimeStr(r.scheduled_start)] = true;
+    });
   });
   return Object.keys(starts).sort();
 }
@@ -845,11 +888,14 @@ function setup() {
                          'worked_hours', 'worked_minutes'],
     [SHEETS.CORRECTIONS]: ['correction_id', 'original_event_id', 'employee_code', 'field',
                            'old_value', 'new_value', 'reason', 'requested_by', 'approved_by', 'corrected_at'],
-    [SHEETS.SCHEDULES]: ['business_date', 'employee_code', 'practice_loc_id', 'scheduled_start', 'scheduled_hours', 'note'],
     [SHEETS.WEEKLY_SUMMARY]: ['week_start', 'week_end', 'employee_code', 'employee_name',
                               'worked_hours', 'worked_minutes', 'generated_at'],
     'errors': ['at', 'message', 'stack']
   };
+
+  const scheduleColumns = ['business_date', 'employee_code', 'practice_loc_id', 'scheduled_start', 'scheduled_hours', 'note'];
+  defs[SHEETS.SCHEDULES_LEGACY] = scheduleColumns; // kept only so migrateSchedulesToCategories() can still read it
+  SCHEDULE_CATEGORIES.forEach(cat => { defs[scheduleSheetName(cat)] = scheduleColumns; });
 
   Object.keys(defs).forEach(name => {
     let sh = ss.getSheetByName(name);
@@ -1241,9 +1287,14 @@ function handleReportMeta(req) {
  * Hours are formatted to always show 2 decimal places (e.g. "3.00"), since
  * that's precise enough to distinguish individual minutes.
  *
- * A date normally gets one column, labeled with just the date. But if
- * distinctSessionStarts() finds 2+ distinct scheduled_start times on that
- * date (matching the location filter) — e.g. a morning and an evening
+ * A date with no practice scheduled at all (across the categories implied
+ * by the employee filter — see distinctSessionStarts()) gets no column at
+ * all; it's simply left out of the report rather than showing as a
+ * misleading all-zero day.
+ *
+ * Otherwise a date normally gets one column, labeled with just the date.
+ * But if distinctSessionStarts() finds 2+ distinct scheduled_start times on
+ * that date (matching the location filter) — e.g. a morning and an evening
  * practice — it becomes multiple columns instead, labeled "yyyy-MM-dd(1)",
  * "yyyy-MM-dd(2)", etc. in start-time order. splitBySession() assigns each
  * punch to a column using a 30-minutes-before-start threshold: a punch
@@ -1313,6 +1364,18 @@ function handleReport(req) {
     return empCodesFilter.indexOf(upper) !== -1 || empPrefixFilter.indexOf(upper.charAt(0)) !== -1;
   }
 
+  // Which categories' schedule sheets can possibly contain a relevant date/
+  // session — with no employee filter, every category; with a filter, only
+  // the categories it could actually match. Used to decide which dates have
+  // a practice scheduled at all (see Pass 2 below).
+  const categories = !hasEmpFilter
+    ? SCHEDULE_CATEGORIES.slice()
+    : Array.from(new Set(
+        SCHEDULE_CATEGORIES.filter(cat =>
+          empPrefixFilter.indexOf(cat) !== -1 ||
+          empCodesFilter.some(c => c.charAt(0) === cat))
+      ));
+
   const t = readHeader(SHEETS.EVENTS);
   const lastRow = t.sheet.getLastRow();
 
@@ -1344,11 +1407,14 @@ function handleReport(req) {
   }
 
   // Pass 2: build the column list — one per date normally, or one per
-  // session (see distinctSessionStarts()) on a date with 2+ practices.
+  // session (see distinctSessionStarts()) on a date with 2+ practices. A
+  // date with no scheduled practice at all for these categories is dropped
+  // entirely — an unscheduled day has no business appearing in the report.
   const columns = []; // [{label, date, sessionStart}] — sessionStart is null for a single-session date
   dates.forEach(d => {
-    const starts = distinctSessionStarts(d, locFilter);
-    if (starts.length <= 1) {
+    const starts = distinctSessionStarts(d, locFilter, categories);
+    if (starts.length === 0) return;
+    if (starts.length === 1) {
       columns.push({ label: d, date: d, sessionStart: null });
     } else {
       starts.forEach((s, i) => columns.push({ label: d + '(' + (i + 1) + ')', date: d, sessionStart: s }));
@@ -1377,8 +1443,9 @@ function handleReport(req) {
     const dayEvents = eventsByDayEmployee[key];
     if (!perEmployeeCol[code]) perEmployeeCol[code] = {};
 
-    const starts = distinctSessionStarts(d, locFilter);
-    if (starts.length <= 1) {
+    const starts = distinctSessionStarts(d, locFilter, categories);
+    if (starts.length === 0) return; // no practice scheduled that day — dropped from columns, so skip
+    if (starts.length === 1) {
       if (!matchesLocFilter(dayEvents)) return;
       const worked = recomputeDayWorked(code, d, dayEvents);
       perEmployeeCol[code][d] = isNum(worked.hours) ? Number(worked.hours) : 0;
@@ -1479,7 +1546,8 @@ function handleReport(req) {
    ════════════════════════════════════════════ */
 
 /**
- * Returns the practice-location dropdown options for schedule.html.
+ * Returns the practice-location dropdown options, and the category list
+ * (National A / Sparring / National Service / NYDS), for schedule.html.
  * Requires the shared admin password (same one as report.html).
  */
 function handleScheduleMeta(req) {
@@ -1491,15 +1559,19 @@ function handleScheduleMeta(req) {
     .filter(r => truthy(r.is_active))
     .map(r => ({ id: String(r.loc_id), label: String(r.name) + ' (' + String(r.type) + ')' }));
 
-  return { ok: true, locations: locations };
+  const categories = SCHEDULE_CATEGORIES.map(id => ({ id: id, label: SCHEDULE_CATEGORY_LABELS[id] }));
+
+  return { ok: true, locations: locations, categories: categories };
 }
 
 /**
- * Adds one schedules row for every matching date, all sharing the same start
- * time / hours / location / employee / note. Meant for the common case where
- * practice happens at the same time and place for weeks at a stretch, so the
- * admin doesn't have to type one row per date. Dates come from two optional,
- * combinable sources — at least one must produce a date:
+ * Adds one row to the chosen category's schedule sheet (schedule_A/S/N/Y —
+ * see SCHEDULE_CATEGORY_LABELS) for every matching date, all sharing the
+ * same start time / hours / location / employee / note. Meant for the
+ * common case where practice happens at the same time and place for weeks
+ * at a stretch, so the admin doesn't have to type one row per date. Dates
+ * come from two optional, combinable sources — at least one must produce a
+ * date:
  *   - A recurring pattern: start_date + end_date + weekdays (0=Sun..6=Sat).
  *     All three are required together if any of them is given.
  *   - Individually picked dates: the dates array ('yyyy-MM-dd' strings),
@@ -1508,14 +1580,20 @@ function handleScheduleMeta(req) {
  * few extra individual dates can be submitted in the same request.
  *
  * employee_code and practice_loc_id are optional, same as manual entry:
- * blank employee_code = everyone, blank practice_loc_id = any location.
+ * blank employee_code = everyone in this category, blank practice_loc_id =
+ * any location.
  *
- * After adding the rows, the whole schedules sheet is re-sorted by date and
- * time (sortSchedulesSheet()) so it stays in chronological order.
+ * After adding the rows, that category's sheet is re-sorted by date and
+ * time (sortScheduleSheetByName()) so it stays in chronological order.
  */
 function handleAddSchedule(req) {
   if (!checkReportPassword(req.password)) {
     return { ok: false, error: 'BAD_PASSWORD', message: 'Incorrect password.' };
+  }
+
+  const category = String(req.category || '').trim().toUpperCase();
+  if (SCHEDULE_CATEGORIES.indexOf(category) === -1) {
+    return { ok: false, error: 'BAD_CATEGORY', message: 'Please choose a category.' };
   }
 
   const startDate = String(req.start_date || '').trim();
@@ -1559,9 +1637,10 @@ function handleAddSchedule(req) {
   const employeeCode = String(req.employee_code || '').trim().toUpperCase();
   const practiceLocId = String(req.practice_loc_id || '').trim();
   const note = String(req.note || '').trim();
+  const sheetName = scheduleSheetName(category);
 
   dates.forEach(d => {
-    appendRowByHeader(SHEETS.SCHEDULES, {
+    appendRowByHeader(sheetName, {
       business_date: d,
       employee_code: employeeCode,
       practice_loc_id: practiceLocId,
@@ -1571,22 +1650,22 @@ function handleAddSchedule(req) {
     });
   });
 
-  sortSchedulesSheet();
+  sortScheduleSheetByName(sheetName);
 
   return { ok: true, added: dates.length };
 }
 
-/** Re-sorts the schedules sheet by date without adding anything, for cleaning up rows added by hand. */
+/** Re-sorts every category's schedule sheet by date without adding anything, for cleaning up rows added by hand. */
 function handleSortSchedule(req) {
   if (!checkReportPassword(req.password)) {
     return { ok: false, error: 'BAD_PASSWORD', message: 'Incorrect password.' };
   }
-  sortSchedulesSheet();
+  SCHEDULE_CATEGORIES.forEach(cat => sortScheduleSheetByName(scheduleSheetName(cat)));
   return { ok: true };
 }
 
 /**
- * Sorts every row in the schedules sheet by business_date, then by
+ * Sorts every row in the given schedule sheet by business_date, then by
  * scheduled_start within the same date, earliest first. Also normalizes
  * both to a consistent text format while sorting — some rows were typed
  * inconsistently (e.g. "2026-8-23" instead of "2026-08-23", or "9:30"
@@ -1594,8 +1673,8 @@ function handleSortSchedule(req) {
  * values are the same. Safe to run any time; it only reorders rows and
  * rewrites the business_date/scheduled_start columns, nothing else changes.
  */
-function sortSchedulesSheet() {
-  const t = readTable(SHEETS.SCHEDULES);
+function sortScheduleSheetByName(sheetName) {
+  const t = readTable(sheetName);
   if (!t.rows.length) return;
 
   const rows = t.rows.map(r => {
@@ -1615,4 +1694,37 @@ function sortSchedulesSheet() {
     return r[key] !== undefined ? r[key] : '';
   }));
   t.sheet.getRange(2, 1, values.length, t.headers.length).setValues(values);
+}
+
+/**
+ * One-time migration: copies every row from the old unified 'schedules'
+ * sheet into ALL FOUR category sheets (schedule_A/S/N/Y), since every row
+ * in that sheet was a blanket entry (blank employee_code) that applied to
+ * the whole team regardless of category. Run this once, from the Apps
+ * Script editor, after running setup() to create the new sheets — it makes
+ * every practice already entered keep applying to everyone until it's
+ * edited to diverge per category. Safe to run more than once: each
+ * category sheet's existing rows are cleared first, so re-running just
+ * re-copies from 'schedules' rather than duplicating.
+ */
+function migrateSchedulesToCategories() {
+  const old = readTable(SHEETS.SCHEDULES_LEGACY);
+  SCHEDULE_CATEGORIES.forEach(cat => {
+    const name = scheduleSheetName(cat);
+    const sh = sheet(name);
+    if (sh.getLastRow() > 1) sh.getRange(2, 1, sh.getLastRow() - 1, sh.getLastColumn()).clearContent();
+    old.rows.forEach(r => {
+      appendRowByHeader(name, {
+        business_date: normalizeDateStr(r.business_date),
+        employee_code: r.employee_code || '',
+        practice_loc_id: r.practice_loc_id || '',
+        scheduled_start: padTimeStr(r.scheduled_start),
+        scheduled_hours: r.scheduled_hours,
+        note: r.note || ''
+      });
+    });
+    sortScheduleSheetByName(name);
+  });
+  Logger.log('Copied ' + old.rows.length + ' rows from "schedules" into each of: ' +
+             SCHEDULE_CATEGORIES.map(scheduleSheetName).join(', '));
 }
