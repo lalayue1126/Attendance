@@ -136,6 +136,21 @@
   .msg.warn{background:var(--warn-bg);color:var(--warn)}
   .msg.ok{background:var(--ok-bg);color:var(--ok)}
   .hide{display:none}
+
+  /* ── Update notice: dismissible, shown once per new message ── */
+  .notice{
+    background:#fff;border:1px solid var(--ink);border-radius:10px;
+    padding:14px 16px;margin-bottom:16px;
+  }
+  .notice .eyebrow{
+    font-family:var(--mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;
+    color:var(--muted);margin:0 0 6px;
+  }
+  .notice p{font-size:14px;margin:0 0 12px;white-space:pre-wrap}
+  .notice button{
+    width:auto;padding:8px 16px;font-size:13.5px;
+    background:var(--ink);color:#fff;
+  }
   .center{text-align:center}
   .spacer{height:14px}
   .who{font-size:13.5px;color:var(--muted);margin:0 0 14px;font-family:var(--mono)}
@@ -175,6 +190,11 @@
 
   <!-- Punch -->
   <section id="scr-punch" class="hide">
+    <div class="notice hide" id="notice-box">
+      <p class="eyebrow">What's New</p>
+      <p id="notice-text"></p>
+      <button type="button" id="btn-notice-dismiss">Got it</button>
+    </div>
     <p class="who" id="who">&nbsp;</p>
     <div class="geo pending" id="geo"><span class="dot"></span><span id="geo-text">Getting your location…</span></div>
     <div id="punch-msg"></div>
@@ -229,6 +249,7 @@ const CONFIG = {
 const TOKEN_KEY = 'punch.token';
 const QUEUE_KEY = 'punch.queue';
 const LOC_CACHE_KEY = 'punch.practiceLocations';
+const NOTICE_SEEN_KEY = 'punch.noticeSeenAt';
 
 /* ── Helpers ─────────────────────────── */
 const $ = id => document.getElementById(id);
@@ -443,8 +464,26 @@ async function openPunch(){
   store(LOC_CACHE_KEY, JSON.stringify(state.practiceLocations));
   renderPracticeLocations();
 
-  // Pre-select the recommended button (this does not submit; it can still be changed)
-  selectType(r.suggest || 'IN');
+  paintNotice(r.notice, r.notice_updated_at);
+
+  // Always pre-select Check In (this does not submit; it can still be changed)
+  selectType('IN');
+}
+
+/* ── Update notice: shown once per new message, then dismissed for good
+   until the admin saves a different one (see notice.html). ── */
+function paintNotice(message, updatedAt){
+  const box = $('notice-box');
+  if (!message || !updatedAt || load(NOTICE_SEEN_KEY) === updatedAt){
+    box.classList.add('hide');
+    return;
+  }
+  $('notice-text').textContent = message;
+  box.classList.remove('hide');
+  $('btn-notice-dismiss').onclick = () => {
+    store(NOTICE_SEEN_KEY, updatedAt);
+    box.classList.add('hide');
+  };
 }
 
 /* ── Submit punch ───────────────────────── */

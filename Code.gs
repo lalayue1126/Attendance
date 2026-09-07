@@ -155,9 +155,16 @@ function doPost(e) {
       case 'punch':         return json(handlePunch(req));
       case 'report_meta':   return json(handleReportMeta(req));
       case 'report':        return json(handleReport(req));
-      case 'schedule_meta': return json(handleScheduleMeta(req));
-      case 'add_schedule':  return json(handleAddSchedule(req));
-      case 'sort_schedule': return json(handleSortSchedule(req));
+      case 'schedule_meta':   return json(handleScheduleMeta(req));
+      case 'add_schedule':    return json(handleAddSchedule(req));
+      case 'sort_schedule':   return json(handleSortSchedule(req));
+      case 'correction_meta': return json(handleCorrectionMeta(req));
+      case 'find_events':     return json(handleFindEvents(req));
+      case 'edit_event':      return json(handleEditEvent(req));
+      case 'void_event':      return json(handleVoidEvent(req));
+      case 'add_event':       return json(handleAddEvent(req));
+      case 'get_notice':      return json(handleGetNotice(req));
+      case 'set_notice':      return json(handleSetNotice(req));
       default:
         return json({ ok: false, error: 'BAD_ACTION', message: 'Unknown action.' });
     }
@@ -236,6 +243,7 @@ function handleState(req) {
   if (!mode) return { ok: false, error: 'BAD_MODE' };
 
   const last = getLastPunchToday(emp.employee_code);
+  const notice = getAppNotice();
 
   return {
     ok: true,
@@ -243,24 +251,15 @@ function handleState(req) {
     employee_code: emp.employee_code,
     loc_mode: mode,
     loc_mode_label: MODE_LABEL[mode],
-    suggest: suggestNext(last),
     practice_locations: listLocationsByType(mode),
+    notice: notice.message,
+    notice_updated_at: notice.updated_at,
     last: last ? {
       type: last.punch_type,
       type_label: TYPE_LABEL[last.punch_type] || last.punch_type,
       at_label: Utilities.formatDate(last.punched_at, CONFIG.TZ, 'HH:mm')
     } : null
   };
-}
-
-/**
- * Guesses which punch type should come next.
- * This is only a suggestion, never auto-confirmed —
- * auto-confirming would flip every subsequent punch after a single missed one.
- */
-function suggestNext(last) {
-  if (!last) return 'IN';
-  return last.punch_type === 'OUT' ? 'IN' : 'OUT';
 }
 
 
@@ -725,6 +724,34 @@ function getLastPunchToday(code) {
   if (!events.length) return null;
   const last = events[events.length - 1];
   return { punch_type: last.type, punched_at: last.punched_at };
+}
+
+/**
+ * All non-voided events for one employee on one business date, oldest
+ * first, with practice_loc_id included (needed by recomputeDayWorked()).
+ * Unlike getTodayEvents(), this scans the whole sheet rather than just the
+ * last 500 rows — it's used by the punch-correction tool, which edits
+ * arbitrary historical dates, not only today's fast path.
+ */
+function getDayEvents(code, businessDateStr) {
+  const t = readHeader(SHEETS.EVENTS);
+  const lastRow = t.sheet.getLastRow();
+  if (lastRow < 2) return [];
+
+  const values = t.sheet.getRange(2, 1, lastRow - 1, t.headers.length).getValues();
+  const out = [];
+  values.forEach(r => {
+    if (String(r[t.col.employee_code]).trim().toUpperCase() !== String(code).trim().toUpperCase()) return;
+    if (truthy(r[t.col.is_voided])) return;
+    if (normalizeDateStr(r[t.col.business_date]) !== businessDateStr) return;
+    out.push({
+      type: String(r[t.col.punch_type]),
+      punched_at: new Date(r[t.col.punched_at]),
+      practice_loc_id: String(r[t.col.practice_loc_id] || '')
+    });
+  });
+  out.sort((a, b) => a.punched_at - b.punched_at);
+  return out;
 }
 
 function existsUuid(uuid) {
@@ -1267,6 +1294,46 @@ function checkReportPassword(pw) {
 }
 
 /**
+ * The "what's new" notice shown on the punch screen (index.html) after an
+ * update. Stored as script properties rather than a sheet since it's a
+ * single piece of text, not tabular data. updated_at changes every time the
+ * message is saved (even to the same text) — index.html compares it against
+ * the last one it showed (kept in localStorage) to decide whether to show
+ * the notice again, so re-saving the same wording still re-surfaces it.
+ */
+function getAppNotice() {
+  const props = PropertiesService.getScriptProperties();
+  return {
+    message: props.getProperty('APP_NOTICE_MESSAGE') || '',
+    updated_at: props.getProperty('APP_NOTICE_UPDATED_AT') || ''
+  };
+}
+
+/** Saves the update notice shown to players. Requires the shared admin password (see notice.html). */
+function handleSetNotice(req) {
+  if (!checkReportPassword(req.password)) {
+    return { ok: false, error: 'BAD_PASSWORD', message: 'Incorrect password.' };
+  }
+
+  const message = String(req.message || '').trim();
+  const props = PropertiesService.getScriptProperties();
+  const updatedAt = new Date().toISOString();
+  props.setProperty('APP_NOTICE_MESSAGE', message);
+  props.setProperty('APP_NOTICE_UPDATED_AT', updatedAt);
+
+  return { ok: true, message: message, updated_at: updatedAt };
+}
+
+/** Returns the current update notice, for notice.html to pre-fill its textbox. Requires the admin password. */
+function handleGetNotice(req) {
+  if (!checkReportPassword(req.password)) {
+    return { ok: false, error: 'BAD_PASSWORD', message: 'Incorrect password.' };
+  }
+  const notice = getAppNotice();
+  return { ok: true, message: notice.message, updated_at: notice.updated_at };
+}
+
+/**
  * Returns the filter options (employees) for the report screen's dropdowns.
  * Requires the report password — this is the only data report.html can see
  * before authenticating.
@@ -1728,4 +1795,294 @@ function migrateSchedulesToCategories() {
   });
   Logger.log('Copied ' + old.rows.length + ' rows from "schedules" into each of: ' +
              SCHEDULE_CATEGORIES.map(scheduleSheetName).join(', '));
+}
+
+
+/* ════════════════════════════════════════════
+   11. Punch correction (admin, password-protected)
+   ════════════════════════════════════════════ */
+
+/**
+ * Returns the practice-location dropdown options for correction.html.
+ * Requires the shared admin password (same one as report.html/schedule.html).
+ */
+function handleCorrectionMeta(req) {
+  if (!checkReportPassword(req.password)) {
+    return { ok: false, error: 'BAD_PASSWORD', message: 'Incorrect password.' };
+  }
+
+  const locations = readTable(SHEETS.LOCATIONS).rows
+    .filter(r => truthy(r.is_active))
+    .map(r => ({ id: String(r.loc_id), label: String(r.name) + ' (' + String(r.type) + ')' }));
+
+  return { ok: true, locations: locations };
+}
+
+/**
+ * Looks up one employee's punches on one business date — voided ones
+ * included (marked as such), so the admin can see the full picture before
+ * deciding what to fix. This is the search step: the admin picks one result
+ * to edit or void, or finds nothing and uses "add a missing punch" instead.
+ */
+function handleFindEvents(req) {
+  if (!checkReportPassword(req.password)) {
+    return { ok: false, error: 'BAD_PASSWORD', message: 'Incorrect password.' };
+  }
+
+  const code = String(req.employee_code || '').trim().toUpperCase();
+  const bDate = String(req.business_date || '').trim();
+  if (!code) return { ok: false, error: 'BAD_REQUEST', message: 'Please enter a player code.' };
+  if (!bDate) return { ok: false, error: 'BAD_REQUEST', message: 'Please choose a date.' };
+
+  const emp = findEmployee(code);
+  if (!emp) return { ok: false, error: 'NOT_FOUND', message: 'That player code is not registered.' };
+
+  const t = readHeader(SHEETS.EVENTS);
+  const lastRow = t.sheet.getLastRow();
+  const events = [];
+  if (lastRow >= 2) {
+    const values = t.sheet.getRange(2, 1, lastRow - 1, t.headers.length).getValues();
+    values.forEach(r => {
+      if (String(r[t.col.employee_code]).trim().toUpperCase() !== code) return;
+      if (normalizeDateStr(r[t.col.business_date]) !== bDate) return;
+      events.push({
+        event_id: String(r[t.col.event_id]),
+        punch_type: String(r[t.col.punch_type]),
+        punched_at: new Date(r[t.col.punched_at]).toISOString(),
+        practice_loc_id: String(r[t.col.practice_loc_id] || ''),
+        practice_loc_name: String(r[t.col.practice_loc_name] || ''),
+        geo_status: String(r[t.col.geo_status] || ''),
+        is_voided: truthy(r[t.col.is_voided])
+      });
+    });
+  }
+  events.sort((a, b) => new Date(a.punched_at) - new Date(b.punched_at));
+
+  return { ok: true, employee_name: emp.name, events: events };
+}
+
+/**
+ * Edits an existing, not-yet-voided punch: player, Check In/Leave Early,
+ * practice location, and/or date+time. Any field left the same as before is
+ * simply not logged as a change. Recomputes that day's worked-hours
+ * snapshot on the edited row afterward (best-effort only — handleReport()
+ * and buildWeeklySummary() never trust this snapshot anyway, they always
+ * recompute live from punch_events + the current schedule).
+ *
+ * One row is appended to the corrections sheet per changed field, so the
+ * full before/after history stays auditable there.
+ */
+function handleEditEvent(req) {
+  if (!checkReportPassword(req.password)) {
+    return { ok: false, error: 'BAD_PASSWORD', message: 'Incorrect password.' };
+  }
+
+  const eventId = String(req.event_id || '').trim();
+  const reason = String(req.reason || '').trim();
+  const correctedBy = String(req.corrected_by || '').trim();
+  if (!eventId) return { ok: false, error: 'BAD_REQUEST', message: 'Missing event.' };
+  if (!reason) return { ok: false, error: 'NO_REASON', message: 'Please explain why this is being corrected.' };
+
+  const newCode = String(req.employee_code || '').trim().toUpperCase();
+  const newType = String(req.punch_type || '').trim().toUpperCase();
+  const newLocId = String(req.practice_loc_id || '').trim();
+  const newDate = String(req.date || '').trim();
+  const newTime = String(req.time || '').trim();
+  if (!newCode) return { ok: false, error: 'BAD_REQUEST', message: 'Please enter a player code.' };
+  if (!TYPE_LABEL[newType]) return { ok: false, error: 'BAD_REQUEST', message: 'Please choose Check In or Leave Early.' };
+  if (!newDate || !newTime) return { ok: false, error: 'BAD_REQUEST', message: 'Please enter a valid date and time.' };
+
+  const emp = findEmployee(newCode);
+  if (!emp) return { ok: false, error: 'NOT_FOUND', message: 'That player code is not registered.' };
+
+  const practiceLoc = readTable(SHEETS.LOCATIONS).rows
+    .find(l => truthy(l.is_active) && String(l.loc_id).trim() === newLocId);
+  if (!practiceLoc) return { ok: false, error: 'BAD_LOCATION', message: 'Please choose a valid practice location.' };
+
+  const t = readHeader(SHEETS.EVENTS);
+  const lastRow = t.sheet.getLastRow();
+  if (lastRow < 2) return { ok: false, error: 'NOT_FOUND', message: 'Punch not found.' };
+  const values = t.sheet.getRange(2, 1, lastRow - 1, t.headers.length).getValues();
+  const idx = values.findIndex(r => String(r[t.col.event_id]) === eventId);
+  if (idx < 0) return { ok: false, error: 'NOT_FOUND', message: 'Punch not found.' };
+  const row = values[idx];
+  if (truthy(row[t.col.is_voided])) {
+    return { ok: false, error: 'ALREADY_VOIDED', message: 'This punch has already been voided and can’t be edited.' };
+  }
+
+  const newPunchedAt = Utilities.parseDate(newDate + ' ' + newTime, CONFIG.TZ, 'yyyy-MM-dd HH:mm');
+  const newBusinessDate = businessDate(newPunchedAt);
+
+  const oldCode = String(row[t.col.employee_code]).trim().toUpperCase();
+  const oldType = String(row[t.col.punch_type]);
+  const oldLocId = String(row[t.col.practice_loc_id] || '').trim();
+  const oldPunchedAt = new Date(row[t.col.punched_at]);
+
+  const changes = [];
+  if (oldCode !== newCode) changes.push(['employee_code', oldCode, emp.employee_code]);
+  if (oldType !== newType) changes.push(['punch_type', oldType, newType]);
+  if (oldLocId !== practiceLoc.loc_id) changes.push(['practice_loc_id', oldLocId, practiceLoc.loc_id]);
+  if (Math.abs(oldPunchedAt.getTime() - newPunchedAt.getTime()) > 60000) {
+    changes.push(['punched_at', oldPunchedAt.toISOString(), newPunchedAt.toISOString()]);
+  }
+  if (!changes.length) {
+    return { ok: false, error: 'NO_CHANGE', message: 'Nothing was changed.' };
+  }
+
+  const sheetRow = idx + 2;
+  t.sheet.getRange(sheetRow, t.col.employee_code + 1).setValue(emp.employee_code);
+  t.sheet.getRange(sheetRow, t.col.employee_name + 1).setValue(emp.name);
+  t.sheet.getRange(sheetRow, t.col.loc_id + 1).setValue(String(practiceLoc.type));
+  t.sheet.getRange(sheetRow, t.col.loc_name + 1).setValue(MODE_LABEL[String(practiceLoc.type).toUpperCase()] || String(practiceLoc.type));
+  t.sheet.getRange(sheetRow, t.col.punch_type + 1).setValue(newType);
+  t.sheet.getRange(sheetRow, t.col.practice_loc_id + 1).setValue(practiceLoc.loc_id);
+  t.sheet.getRange(sheetRow, t.col.practice_loc_name + 1).setValue(practiceLoc.name);
+  t.sheet.getRange(sheetRow, t.col.punched_at + 1).setValue(newPunchedAt);
+  t.sheet.getRange(sheetRow, t.col.business_date + 1).setValue(newBusinessDate);
+
+  const dayEvents = getDayEvents(emp.employee_code, newBusinessDate);
+  const worked = recomputeDayWorked(emp.employee_code, newBusinessDate, dayEvents);
+  t.sheet.getRange(sheetRow, t.col.worked_hours + 1).setValue(worked.hours);
+  t.sheet.getRange(sheetRow, t.col.worked_minutes + 1).setValue(worked.minutes);
+
+  changes.forEach(([field, oldVal, newVal]) => {
+    appendRowByHeader(SHEETS.CORRECTIONS, {
+      correction_id: Utilities.getUuid(),
+      original_event_id: eventId,
+      employee_code: emp.employee_code,
+      field: field,
+      old_value: oldVal,
+      new_value: newVal,
+      reason: reason,
+      requested_by: correctedBy,
+      approved_by: '',
+      corrected_at: new Date()
+    });
+  });
+
+  return { ok: true, changed: changes.length };
+}
+
+/**
+ * Voids a punch (never physically deleted, same as the old manual
+ * voidEvent() editor function) and logs the reason to the corrections
+ * sheet. A already-voided punch can't be voided again.
+ */
+function handleVoidEvent(req) {
+  if (!checkReportPassword(req.password)) {
+    return { ok: false, error: 'BAD_PASSWORD', message: 'Incorrect password.' };
+  }
+
+  const eventId = String(req.event_id || '').trim();
+  const reason = String(req.reason || '').trim();
+  const correctedBy = String(req.corrected_by || '').trim();
+  if (!eventId) return { ok: false, error: 'BAD_REQUEST', message: 'Missing event.' };
+  if (!reason) return { ok: false, error: 'NO_REASON', message: 'Please explain why this punch is being voided.' };
+
+  const t = readHeader(SHEETS.EVENTS);
+  const lastRow = t.sheet.getLastRow();
+  if (lastRow < 2) return { ok: false, error: 'NOT_FOUND', message: 'Punch not found.' };
+  const values = t.sheet.getRange(2, 1, lastRow - 1, t.headers.length).getValues();
+  const idx = values.findIndex(r => String(r[t.col.event_id]) === eventId);
+  if (idx < 0) return { ok: false, error: 'NOT_FOUND', message: 'Punch not found.' };
+  const row = values[idx];
+  if (truthy(row[t.col.is_voided])) {
+    return { ok: false, error: 'ALREADY_VOIDED', message: 'This punch has already been voided.' };
+  }
+
+  const sheetRow = idx + 2;
+  t.sheet.getRange(sheetRow, t.col.is_voided + 1).setValue(true);
+
+  appendRowByHeader(SHEETS.CORRECTIONS, {
+    correction_id: Utilities.getUuid(),
+    original_event_id: eventId,
+    employee_code: String(row[t.col.employee_code]),
+    field: 'is_voided',
+    old_value: 'FALSE',
+    new_value: 'TRUE',
+    reason: reason,
+    requested_by: correctedBy,
+    approved_by: '',
+    corrected_at: new Date()
+  });
+
+  return { ok: true };
+}
+
+/**
+ * Manually creates a punch that was never recorded live (e.g. the player
+ * genuinely forgot to check in, or was offline and it never queued). Marked
+ * geo_status: 'MANUAL' so it's clearly distinguishable from a real
+ * GPS-backed punch when the raw sheet is inspected directly.
+ */
+function handleAddEvent(req) {
+  if (!checkReportPassword(req.password)) {
+    return { ok: false, error: 'BAD_PASSWORD', message: 'Incorrect password.' };
+  }
+
+  const code = String(req.employee_code || '').trim().toUpperCase();
+  const type = String(req.punch_type || '').trim().toUpperCase();
+  const locId = String(req.practice_loc_id || '').trim();
+  const date = String(req.date || '').trim();
+  const time = String(req.time || '').trim();
+  const reason = String(req.reason || '').trim();
+  const correctedBy = String(req.corrected_by || '').trim();
+
+  if (!code) return { ok: false, error: 'BAD_REQUEST', message: 'Please enter a player code.' };
+  if (!TYPE_LABEL[type]) return { ok: false, error: 'BAD_REQUEST', message: 'Please choose Check In or Leave Early.' };
+  if (!date || !time) return { ok: false, error: 'BAD_REQUEST', message: 'Please enter a valid date and time.' };
+  if (!reason) return { ok: false, error: 'NO_REASON', message: 'Please explain why this punch is being added.' };
+
+  const emp = findEmployee(code);
+  if (!emp) return { ok: false, error: 'NOT_FOUND', message: 'That player code is not registered.' };
+
+  const practiceLoc = readTable(SHEETS.LOCATIONS).rows
+    .find(l => truthy(l.is_active) && String(l.loc_id).trim() === locId);
+  if (!practiceLoc) return { ok: false, error: 'BAD_LOCATION', message: 'Please choose a valid practice location.' };
+
+  const punchedAt = Utilities.parseDate(date + ' ' + time, CONFIG.TZ, 'yyyy-MM-dd HH:mm');
+  const bDate = businessDate(punchedAt);
+  const eventId = Utilities.getUuid();
+
+  appendRowByHeader(SHEETS.EVENTS, {
+    event_id: eventId,
+    employee_code: emp.employee_code,
+    employee_name: emp.name,
+    loc_id: String(practiceLoc.type),
+    loc_name: MODE_LABEL[String(practiceLoc.type).toUpperCase()] || String(practiceLoc.type),
+    punched_at: punchedAt,
+    punch_type: type,
+    practice_loc_id: practiceLoc.loc_id,
+    practice_loc_name: practiceLoc.name,
+    business_date: bDate,
+    lat: '', lng: '', accuracy_m: '', distance_m: '',
+    geo_status: 'MANUAL',
+    address: '', client_uuid: '', client_time: '',
+    user_agent: 'admin-correction-tool',
+    is_voided: false,
+    worked_hours: '', worked_minutes: ''
+  });
+
+  const dayEvents = getDayEvents(emp.employee_code, bDate);
+  const worked = recomputeDayWorked(emp.employee_code, bDate, dayEvents);
+  const t = readHeader(SHEETS.EVENTS);
+  const newRow = t.sheet.getLastRow();
+  t.sheet.getRange(newRow, t.col.worked_hours + 1).setValue(worked.hours);
+  t.sheet.getRange(newRow, t.col.worked_minutes + 1).setValue(worked.minutes);
+
+  appendRowByHeader(SHEETS.CORRECTIONS, {
+    correction_id: Utilities.getUuid(),
+    original_event_id: eventId,
+    employee_code: emp.employee_code,
+    field: '(new punch)',
+    old_value: '',
+    new_value: TYPE_LABEL[type] + ' @ ' + practiceLoc.name + ' ' +
+               Utilities.formatDate(punchedAt, CONFIG.TZ, 'yyyy-MM-dd HH:mm'),
+    reason: reason,
+    requested_by: correctedBy,
+    approved_by: '',
+    corrected_at: new Date()
+  });
+
+  return { ok: true, event_id: eventId };
 }
