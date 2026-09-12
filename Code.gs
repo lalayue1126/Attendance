@@ -638,25 +638,26 @@ function distinctSessionStarts(businessDateStr, categories) {
 }
 
 /**
- * Splits one day's full event list into one sub-list per session, given that
- * date's sorted session start times. A punch belongs to session i if it's at
- * or after (start_i minus 30 minutes) and before (start_(i+1) minus 30
- * minutes) — so with sessions at 09:00 and 15:00, anything from 14:30 onward
- * counts as the second session, everything earlier as the first. Nothing
- * before the first session's threshold is dropped; it still lands in
- * session 0, since there's no earlier session to claim it.
+ * Splits one day's full event list into one sub-list per session, by the
+ * ORDER of Check In punches rather than a time-of-day threshold: the
+ * employee's 1st Check In of the day (and everything up to their 2nd Check
+ * In) is session 1, their 2nd Check In (and everything up to their 3rd) is
+ * session 2, and so on. This is what actually tells two practices apart —
+ * a player only checks in once per practice they attend, regardless of
+ * exactly when that practice happens to start. Anything before the first
+ * Check In (a stray Leave Early with nothing preceding it, in malformed
+ * data) falls back to session 1. A Check In beyond the number of scheduled
+ * sessions that day is folded into the last session rather than dropped.
  */
-function splitBySession(dayEvents, starts, businessDateStr) {
-  const boundaries = starts.map((s, i) => {
-    if (i === 0) return -Infinity;
-    const t = Utilities.parseDate(businessDateStr + ' ' + s, CONFIG.TZ, 'yyyy-MM-dd HH:mm');
-    return t.getTime() - 30 * 60000;
-  });
+function splitBySession(dayEvents, starts) {
+  const sorted = dayEvents.slice().sort((a, b) => a.punched_at - b.punched_at);
   const buckets = starts.map(() => []);
-  dayEvents.forEach(ev => {
-    let idx = 0;
-    for (let i = 0; i < boundaries.length; i++) {
-      if (ev.punched_at.getTime() >= boundaries[i]) idx = i;
+  let idx = 0;
+  let sawFirstIn = false;
+  sorted.forEach(ev => {
+    if (ev.type === 'IN') {
+      if (sawFirstIn) idx = Math.min(idx + 1, starts.length - 1);
+      sawFirstIn = true;
     }
     buckets[idx].push(ev);
   });
@@ -1377,10 +1378,10 @@ function handleReportMeta(req) {
  * But if distinctSessionStarts() finds 2+ distinct scheduled_start times on
  * that date — e.g. a morning and an evening practice — it becomes multiple
  * columns instead, labeled "yyyy-MM-dd(1)", "yyyy-MM-dd(2)", etc. in
- * start-time order. splitBySession() assigns each punch to a column using a
- * 30-minutes-before-start threshold: a punch counts toward session N once
- * it's within 30 minutes of session N's start (and not yet within 30
- * minutes of session N+1's start). This keeps a double-practice day from
+ * start-time order. splitBySession() assigns each punch to a column by the
+ * ORDER of that employee's Check Ins that day, not by time of day: their
+ * 1st Check In (and everything up to their 2nd) is session 1, their 2nd
+ * Check In is session 2, and so on. This keeps a double-practice day from
  * having one session's hours silently swallowed into the other's schedule
  * window, which is what happened when the whole day shared a single
  * schedule for clipping.
@@ -1520,7 +1521,7 @@ function handleReport(req) {
       perEmployeeCol[code][d] = isNum(worked.hours) ? Number(worked.hours) : 0;
       colIncluded[d + '|' + code] = true;
     } else {
-      const buckets = splitBySession(dayEvents, starts, d);
+      const buckets = splitBySession(dayEvents, starts);
       buckets.forEach((bucketEvents, i) => {
         if (!bucketEvents.length) return;
         const label = d + '(' + (i + 1) + ')';
