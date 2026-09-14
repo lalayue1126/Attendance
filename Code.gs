@@ -81,7 +81,8 @@ const SHEETS = {
   EVENTS: 'punch_events',
   CORRECTIONS: 'corrections',
   SCHEDULES_LEGACY: 'schedules', // pre-category-split sheet, kept only for migrateSchedulesToCategories()
-  WEEKLY_SUMMARY: 'weekly_summary'
+  WEEKLY_SUMMARY: 'weekly_summary',
+  REQUESTS: 'punch_requests'
 };
 
 const TYPE_LABEL = {
@@ -165,6 +166,11 @@ function doPost(e) {
       case 'add_event':       return json(handleAddEvent(req));
       case 'get_notice':      return json(handleGetNotice(req));
       case 'set_notice':      return json(handleSetNotice(req));
+      case 'request_meta':    return json(handleRequestMeta(req));
+      case 'submit_request':  return json(handleSubmitRequest(req));
+      case 'list_requests':   return json(handleListRequests(req));
+      case 'approve_request': return json(handleApproveRequest(req));
+      case 'reject_request':  return json(handleRejectRequest(req));
       default:
         return json({ ok: false, error: 'BAD_ACTION', message: 'Unknown action.' });
     }
@@ -936,6 +942,10 @@ function setup() {
                            'old_value', 'new_value', 'reason', 'requested_by', 'approved_by', 'corrected_at'],
     [SHEETS.WEEKLY_SUMMARY]: ['week_start', 'week_end', 'employee_code', 'employee_name',
                               'worked_hours', 'worked_minutes', 'generated_at'],
+    [SHEETS.REQUESTS]: ['request_id', 'employee_code', 'employee_name', 'business_date',
+                        'practice_loc_id', 'practice_loc_name', 'arrival_time', 'has_early_leave',
+                        'departure_time', 'reason', 'status', 'submitted_at', 'reviewed_at',
+                        'reviewed_by', 'review_note', 'arrival_event_id', 'departure_event_id'],
     'errors': ['at', 'message', 'stack']
   };
 
@@ -2011,10 +2021,51 @@ function handleVoidEvent(req) {
 }
 
 /**
+ * Creates one manual (non-live) punch_events row and recomputes that day's
+ * worked-hours snapshot on it. Shared by handleAddEvent() (admin-entered,
+ * via correction.html) and handleApproveRequest() (an approved player
+ * self-service request, via request.html/requests.html) so both paths
+ * write the row identically. geo_status is always 'MANUAL' so it's clearly
+ * distinguishable from a real GPS-backed punch when the raw sheet is
+ * inspected directly; sourceLabel goes into user_agent to say which of the
+ * two tools created it.
+ */
+function createManualPunchEvent(emp, practiceLoc, type, punchedAt, sourceLabel) {
+  const bDate = businessDate(punchedAt);
+  const eventId = Utilities.getUuid();
+
+  appendRowByHeader(SHEETS.EVENTS, {
+    event_id: eventId,
+    employee_code: emp.employee_code,
+    employee_name: emp.name,
+    loc_id: String(practiceLoc.type),
+    loc_name: MODE_LABEL[String(practiceLoc.type).toUpperCase()] || String(practiceLoc.type),
+    punched_at: punchedAt,
+    punch_type: type,
+    practice_loc_id: practiceLoc.loc_id,
+    practice_loc_name: practiceLoc.name,
+    business_date: bDate,
+    lat: '', lng: '', accuracy_m: '', distance_m: '',
+    geo_status: 'MANUAL',
+    address: '', client_uuid: '', client_time: '',
+    user_agent: sourceLabel,
+    is_voided: false,
+    worked_hours: '', worked_minutes: ''
+  });
+
+  const dayEvents = getDayEvents(emp.employee_code, bDate);
+  const worked = recomputeDayWorked(emp.employee_code, bDate, dayEvents);
+  const t = readHeader(SHEETS.EVENTS);
+  const newRow = t.sheet.getLastRow();
+  t.sheet.getRange(newRow, t.col.worked_hours + 1).setValue(worked.hours);
+  t.sheet.getRange(newRow, t.col.worked_minutes + 1).setValue(worked.minutes);
+
+  return { eventId: eventId, businessDate: bDate };
+}
+
+/**
  * Manually creates a punch that was never recorded live (e.g. the player
- * genuinely forgot to check in, or was offline and it never queued). Marked
- * geo_status: 'MANUAL' so it's clearly distinguishable from a real
- * GPS-backed punch when the raw sheet is inspected directly.
+ * genuinely forgot to check in, or was offline and it never queued).
  */
 function handleAddEvent(req) {
   if (!checkReportPassword(req.password)) {
@@ -2042,38 +2093,11 @@ function handleAddEvent(req) {
   if (!practiceLoc) return { ok: false, error: 'BAD_LOCATION', message: 'Please choose a valid practice location.' };
 
   const punchedAt = Utilities.parseDate(date + ' ' + time, CONFIG.TZ, 'yyyy-MM-dd HH:mm');
-  const bDate = businessDate(punchedAt);
-  const eventId = Utilities.getUuid();
-
-  appendRowByHeader(SHEETS.EVENTS, {
-    event_id: eventId,
-    employee_code: emp.employee_code,
-    employee_name: emp.name,
-    loc_id: String(practiceLoc.type),
-    loc_name: MODE_LABEL[String(practiceLoc.type).toUpperCase()] || String(practiceLoc.type),
-    punched_at: punchedAt,
-    punch_type: type,
-    practice_loc_id: practiceLoc.loc_id,
-    practice_loc_name: practiceLoc.name,
-    business_date: bDate,
-    lat: '', lng: '', accuracy_m: '', distance_m: '',
-    geo_status: 'MANUAL',
-    address: '', client_uuid: '', client_time: '',
-    user_agent: 'admin-correction-tool',
-    is_voided: false,
-    worked_hours: '', worked_minutes: ''
-  });
-
-  const dayEvents = getDayEvents(emp.employee_code, bDate);
-  const worked = recomputeDayWorked(emp.employee_code, bDate, dayEvents);
-  const t = readHeader(SHEETS.EVENTS);
-  const newRow = t.sheet.getLastRow();
-  t.sheet.getRange(newRow, t.col.worked_hours + 1).setValue(worked.hours);
-  t.sheet.getRange(newRow, t.col.worked_minutes + 1).setValue(worked.minutes);
+  const created = createManualPunchEvent(emp, practiceLoc, type, punchedAt, 'admin-correction-tool');
 
   appendRowByHeader(SHEETS.CORRECTIONS, {
     correction_id: Utilities.getUuid(),
-    original_event_id: eventId,
+    original_event_id: created.eventId,
     employee_code: emp.employee_code,
     field: '(new punch)',
     old_value: '',
@@ -2085,5 +2109,215 @@ function handleAddEvent(req) {
     corrected_at: new Date()
   });
 
-  return { ok: true, event_id: eventId };
+  return { ok: true, event_id: created.eventId };
+}
+
+
+/* ════════════════════════════════════════════
+   12. Missed-punch requests (player self-service, admin-approved)
+   ════════════════════════════════════════════ */
+
+/**
+ * Returns what request.html needs to show the form: the player's own name
+ * (from their device token, same as index.html) and every active practice
+ * location. Unlike the admin tools, this is gated by the player's device
+ * token, not the admin password — a player can only ever submit a request
+ * for themselves.
+ */
+function handleRequestMeta(req) {
+  const emp = authenticate(req.token);
+  if (!emp) return { ok: false, error: 'AUTH' };
+
+  const locations = readTable(SHEETS.LOCATIONS).rows
+    .filter(r => truthy(r.is_active))
+    .map(r => ({ id: String(r.loc_id), label: String(r.name) + ' (' + String(r.type) + ')' }));
+
+  return { ok: true, name: emp.name, employee_code: emp.employee_code, locations: locations };
+}
+
+/**
+ * Records a player's self-reported "I forgot to punch" request as PENDING —
+ * it does NOT touch punch_events yet. An admin has to approve it
+ * (handleApproveRequest()) before it becomes a real punch. arrival_time is
+ * always required (this is fundamentally a "forgot to check in" form);
+ * has_early_leave is an optional add-on for when the player also left
+ * before the scheduled end without pressing Leave Early, in which case
+ * departure_time is required too.
+ */
+function handleSubmitRequest(req) {
+  const emp = authenticate(req.token);
+  if (!emp) return { ok: false, error: 'AUTH' };
+
+  const bDate = String(req.business_date || '').trim();
+  const locId = String(req.practice_loc_id || '').trim();
+  const arrivalTime = String(req.arrival_time || '').trim();
+  const hasEarlyLeave = truthy(req.has_early_leave);
+  const departureTime = String(req.departure_time || '').trim();
+  const reason = String(req.reason || '').trim();
+
+  if (!bDate) return { ok: false, error: 'BAD_REQUEST', message: 'Please choose the practice date.' };
+  if (!arrivalTime) return { ok: false, error: 'BAD_REQUEST', message: 'Please enter your arrival time.' };
+  if (hasEarlyLeave && !departureTime) {
+    return { ok: false, error: 'BAD_REQUEST', message: 'Please enter the time you left early.' };
+  }
+  if (!reason) return { ok: false, error: 'NO_REASON', message: 'Please explain what happened.' };
+
+  const practiceLoc = readTable(SHEETS.LOCATIONS).rows
+    .find(l => truthy(l.is_active) && String(l.loc_id).trim() === locId);
+  if (!practiceLoc) return { ok: false, error: 'BAD_LOCATION', message: 'Please choose a valid practice location.' };
+
+  const requestId = Utilities.getUuid();
+  appendRowByHeader(SHEETS.REQUESTS, {
+    request_id: requestId,
+    employee_code: emp.employee_code,
+    employee_name: emp.name,
+    business_date: bDate,
+    practice_loc_id: practiceLoc.loc_id,
+    practice_loc_name: practiceLoc.name,
+    arrival_time: arrivalTime,
+    has_early_leave: hasEarlyLeave,
+    departure_time: hasEarlyLeave ? departureTime : '',
+    reason: reason,
+    status: 'PENDING',
+    submitted_at: new Date(),
+    reviewed_at: '',
+    reviewed_by: '',
+    review_note: '',
+    arrival_event_id: '',
+    departure_event_id: ''
+  });
+
+  return { ok: true, request_id: requestId };
+}
+
+/**
+ * Lists missed-punch requests for requests.html. status defaults to
+ * 'PENDING' (the review queue); pass 'ALL' to also see already-approved/
+ * rejected ones for context. Requires the shared admin password.
+ */
+function handleListRequests(req) {
+  if (!checkReportPassword(req.password)) {
+    return { ok: false, error: 'BAD_PASSWORD', message: 'Incorrect password.' };
+  }
+
+  const statusFilter = String(req.status || 'PENDING').trim().toUpperCase();
+
+  const requests = readTable(SHEETS.REQUESTS).rows
+    .filter(r => statusFilter === 'ALL' || String(r.status).trim().toUpperCase() === statusFilter)
+    .map(r => ({
+      request_id: String(r.request_id),
+      employee_code: String(r.employee_code),
+      employee_name: String(r.employee_name),
+      business_date: normalizeDateStr(r.business_date),
+      practice_loc_id: String(r.practice_loc_id || ''),
+      practice_loc_name: String(r.practice_loc_name || ''),
+      arrival_time: padTimeStr(r.arrival_time),
+      has_early_leave: truthy(r.has_early_leave),
+      departure_time: r.departure_time ? padTimeStr(r.departure_time) : '',
+      reason: String(r.reason || ''),
+      status: String(r.status || ''),
+      submitted_at: r.submitted_at ? new Date(r.submitted_at).toISOString() : '',
+      reviewed_at: r.reviewed_at ? new Date(r.reviewed_at).toISOString() : '',
+      reviewed_by: String(r.reviewed_by || ''),
+      review_note: String(r.review_note || '')
+    }));
+
+  requests.sort((a, b) => new Date(a.submitted_at) - new Date(b.submitted_at));
+
+  return { ok: true, requests: requests };
+}
+
+/**
+ * Approves a pending request: creates the arrival Check In (and, if
+ * has_early_leave was set, the departure Leave Early too) via
+ * createManualPunchEvent(), then marks the request APPROVED. Only a
+ * currently-PENDING request can be approved — already-reviewed ones are
+ * left alone to avoid creating duplicate punches from a double-click.
+ */
+function handleApproveRequest(req) {
+  if (!checkReportPassword(req.password)) {
+    return { ok: false, error: 'BAD_PASSWORD', message: 'Incorrect password.' };
+  }
+
+  const requestId = String(req.request_id || '').trim();
+  const reviewedBy = String(req.reviewed_by || '').trim();
+  const note = String(req.review_note || '').trim();
+  if (!requestId) return { ok: false, error: 'BAD_REQUEST', message: 'Missing request.' };
+
+  const t = readHeader(SHEETS.REQUESTS);
+  const lastRow = t.sheet.getLastRow();
+  if (lastRow < 2) return { ok: false, error: 'NOT_FOUND', message: 'Request not found.' };
+  const values = t.sheet.getRange(2, 1, lastRow - 1, t.headers.length).getValues();
+  const idx = values.findIndex(r => String(r[t.col.request_id]) === requestId);
+  if (idx < 0) return { ok: false, error: 'NOT_FOUND', message: 'Request not found.' };
+  const row = values[idx];
+  if (String(row[t.col.status]).trim().toUpperCase() !== 'PENDING') {
+    return { ok: false, error: 'ALREADY_REVIEWED', message: 'This request has already been reviewed.' };
+  }
+
+  const code = String(row[t.col.employee_code]).trim().toUpperCase();
+  const emp = findEmployee(code);
+  if (!emp) return { ok: false, error: 'NOT_FOUND', message: 'That player is no longer registered.' };
+
+  const locId = String(row[t.col.practice_loc_id] || '').trim();
+  const practiceLoc = readTable(SHEETS.LOCATIONS).rows.find(l => String(l.loc_id).trim() === locId);
+  if (!practiceLoc) {
+    return { ok: false, error: 'BAD_LOCATION', message: 'That practice location no longer exists — please reject and ask the player to resubmit.' };
+  }
+
+  const bDate = normalizeDateStr(row[t.col.business_date]);
+  const arrivalTime = padTimeStr(row[t.col.arrival_time]);
+  const hasEarlyLeave = truthy(row[t.col.has_early_leave]);
+  const departureTime = row[t.col.departure_time] ? padTimeStr(row[t.col.departure_time]) : '';
+
+  const arrivalAt = Utilities.parseDate(bDate + ' ' + arrivalTime, CONFIG.TZ, 'yyyy-MM-dd HH:mm');
+  const arrivalCreated = createManualPunchEvent(emp, practiceLoc, 'IN', arrivalAt, 'player-request-approved');
+
+  let departureEventId = '';
+  if (hasEarlyLeave && departureTime) {
+    const departureAt = Utilities.parseDate(bDate + ' ' + departureTime, CONFIG.TZ, 'yyyy-MM-dd HH:mm');
+    const departureCreated = createManualPunchEvent(emp, practiceLoc, 'OUT', departureAt, 'player-request-approved');
+    departureEventId = departureCreated.eventId;
+  }
+
+  const sheetRow = idx + 2;
+  t.sheet.getRange(sheetRow, t.col.status + 1).setValue('APPROVED');
+  t.sheet.getRange(sheetRow, t.col.reviewed_at + 1).setValue(new Date());
+  t.sheet.getRange(sheetRow, t.col.reviewed_by + 1).setValue(reviewedBy);
+  t.sheet.getRange(sheetRow, t.col.review_note + 1).setValue(note);
+  t.sheet.getRange(sheetRow, t.col.arrival_event_id + 1).setValue(arrivalCreated.eventId);
+  t.sheet.getRange(sheetRow, t.col.departure_event_id + 1).setValue(departureEventId);
+
+  return { ok: true };
+}
+
+/** Rejects a pending request — no punch_events row is created. Requires a reason, shown back to the player if they ever check their request's status. */
+function handleRejectRequest(req) {
+  if (!checkReportPassword(req.password)) {
+    return { ok: false, error: 'BAD_PASSWORD', message: 'Incorrect password.' };
+  }
+
+  const requestId = String(req.request_id || '').trim();
+  const reviewedBy = String(req.reviewed_by || '').trim();
+  const note = String(req.review_note || '').trim();
+  if (!requestId) return { ok: false, error: 'BAD_REQUEST', message: 'Missing request.' };
+  if (!note) return { ok: false, error: 'NO_REASON', message: 'Please explain why this request is being rejected.' };
+
+  const t = readHeader(SHEETS.REQUESTS);
+  const lastRow = t.sheet.getLastRow();
+  if (lastRow < 2) return { ok: false, error: 'NOT_FOUND', message: 'Request not found.' };
+  const values = t.sheet.getRange(2, 1, lastRow - 1, t.headers.length).getValues();
+  const idx = values.findIndex(r => String(r[t.col.request_id]) === requestId);
+  if (idx < 0) return { ok: false, error: 'NOT_FOUND', message: 'Request not found.' };
+  if (String(values[idx][t.col.status]).trim().toUpperCase() !== 'PENDING') {
+    return { ok: false, error: 'ALREADY_REVIEWED', message: 'This request has already been reviewed.' };
+  }
+
+  const sheetRow = idx + 2;
+  t.sheet.getRange(sheetRow, t.col.status + 1).setValue('REJECTED');
+  t.sheet.getRange(sheetRow, t.col.reviewed_at + 1).setValue(new Date());
+  t.sheet.getRange(sheetRow, t.col.reviewed_by + 1).setValue(reviewedBy);
+  t.sheet.getRange(sheetRow, t.col.review_note + 1).setValue(note);
+
+  return { ok: true };
 }

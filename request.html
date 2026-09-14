@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#16202B">
+<title>Report a Missed Punch</title>
+<style>
+  :root{
+    --ink:#16202B;
+    --ink-soft:#3A4753;
+    --muted:#6B7780;
+    --line:#D8DEDC;
+    --paper:#EFF2F1;
+    --card:#FFFFFF;
+    --ok:#0F6E4F;
+    --ok-bg:#E4F1EB;
+    --warn:#9A4C15;
+    --warn-bg:#FBEEE2;
+    --err:#9B2C2C;
+    --err-bg:#FBEAEA;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:var(--paper);
+    color:var(--ink);
+    font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    font-size:16px;line-height:1.6;
+    min-height:100vh;
+    padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom);
+  }
+  .wrap{max-width:420px;margin:0 auto;padding:0 16px 40px}
+
+  .band{background:var(--ink);color:#fff;margin:0 -16px 20px;padding:18px 20px 16px}
+  .band .eyebrow{
+    font-family:var(--mono);font-size:12px;letter-spacing:.14em;
+    text-transform:uppercase;color:#8FA2B0;margin:0 0 4px;
+  }
+  .band .title{font-size:21px;font-weight:600;margin:0}
+
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:18px;margin-bottom:16px}
+  h2{font-size:16px;font-weight:600;margin:0 0 6px}
+  .note{font-size:13.5px;color:var(--muted);margin:0 0 16px;line-height:1.55}
+  .who{font-size:13.5px;color:var(--muted);margin:0 0 16px;font-family:var(--mono)}
+
+  label{display:block;font-size:13px;font-weight:600;color:var(--ink-soft);margin:0 0 6px}
+  .field{margin-bottom:14px}
+  input,select,textarea{
+    width:100%;padding:12px;font-size:16px;font-family:inherit;
+    border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--ink);
+  }
+  textarea{min-height:80px;resize:vertical;line-height:1.5}
+  input:focus,select:focus,textarea:focus{outline:2px solid var(--ink);outline-offset:1px;border-color:var(--ink)}
+  .row{display:flex;gap:10px}
+  .row .field{flex:1 1 0}
+
+  .check-row{display:flex;align-items:center;gap:10px;margin-bottom:14px}
+  .check-row input[type=checkbox]{width:auto;accent-color:var(--ink)}
+  .check-row label{margin:0;font-size:14.5px;font-weight:500;color:var(--ink)}
+
+  button{
+    font-family:inherit;font-size:16px;font-weight:600;
+    border-radius:10px;border:1px solid transparent;
+    cursor:pointer;width:100%;padding:14px;
+  }
+  button:disabled{opacity:.45;cursor:not-allowed}
+  .btn-primary{background:var(--ink);color:#fff}
+
+  .msg{padding:12px 14px;border-radius:8px;font-size:14px;margin-bottom:14px;line-height:1.55}
+  .msg.err{background:var(--err-bg);color:var(--err)}
+  .msg.warn{background:var(--warn-bg);color:var(--warn)}
+  .msg.ok{background:var(--ok-bg);color:var(--ok)}
+  .hide{display:none}
+  .center{text-align:center}
+
+  .early-leave-field{border-top:1px dashed var(--line);padding-top:14px;margin-top:2px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="band">
+    <p class="eyebrow">Missed Punch</p>
+    <p class="title">Report a Missed Punch</p>
+  </div>
+
+  <!-- No token on this device -->
+  <section id="scr-no-token" class="card hide center">
+    <h2>Please Register First</h2>
+    <p class="note" style="margin:0">
+      This device hasn’t been registered for check-in yet. Please open the check-in page
+      (via your usual tag or QR code) once first, then come back here.
+    </p>
+  </section>
+
+  <!-- Loading -->
+  <section id="scr-boot" class="card center">
+    <p class="note" style="margin:0">Loading…</p>
+  </section>
+
+  <!-- Form -->
+  <section id="scr-form" class="card hide">
+    <p class="who" id="who">&nbsp;</p>
+    <h2>What happened</h2>
+    <p class="note">
+      Use this if you took part in a practice but forgot to Check In (or forgot to press
+      Leave Early when you left before the scheduled end).
+    </p>
+    <div id="form-msg"></div>
+
+    <div class="field">
+      <label for="f-date">Practice date</label>
+      <input id="f-date" type="date">
+    </div>
+
+    <div class="field">
+      <label for="f-loc">Practice location</label>
+      <select id="f-loc"></select>
+    </div>
+
+    <div class="row">
+      <div class="field">
+        <label for="f-arrival">Arrival time</label>
+        <input id="f-arrival" type="time">
+      </div>
+    </div>
+
+    <div class="check-row">
+      <input id="f-early-leave" type="checkbox">
+      <label for="f-early-leave">I also left before the scheduled end time (and forgot to press Leave Early)</label>
+    </div>
+
+    <div class="field early-leave-field hide" id="departure-field">
+      <label for="f-departure">Time you left</label>
+      <input id="f-departure" type="time">
+    </div>
+
+    <div class="field">
+      <label for="f-reason">What happened?</label>
+      <textarea id="f-reason" placeholder="e.g. I checked in on paper but my phone was dead."></textarea>
+    </div>
+
+    <button class="btn-primary" id="btn-submit">Submit Request</button>
+  </section>
+
+  <!-- Done -->
+  <section id="scr-done" class="card hide center">
+    <h2>Submitted</h2>
+    <p class="note" style="margin:0">
+      Your request has been sent to your coach for approval. It won’t appear in your hours until then.
+    </p>
+  </section>
+
+</div>
+
+<script>
+/* ══════════════════════════════════════════
+   Config — same backend as index.html
+   ══════════════════════════════════════════ */
+const CONFIG = {
+  API_URL: 'https://script.google.com/macros/s/AKfycbzevhLv-1CXcH3yhRgHTt6v1vQ7opNhP1dEkQzmni_x6tAXnCOIbShW4pjd9Mjs882EBQ/exec',
+  FETCH_TIMEOUT_MS: 25000
+};
+
+const TOKEN_KEY = 'punch.token'; // same key index.html stores the device token under
+
+const $ = id => document.getElementById(id);
+
+function show(name){
+  ['no-token', 'boot', 'form', 'done'].forEach(s =>
+    $('scr-'+s).classList.toggle('hide', s !== name));
+}
+function setMsg(el, text, kind){
+  el.innerHTML = text ? `<div class="msg ${kind||'err'}">${esc(text)}</div>` : '';
+}
+function esc(s){
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function load(key){
+  try { return localStorage.getItem(key); } catch(e) { return null; }
+}
+
+async function api(payload){
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), CONFIG.FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(CONFIG.API_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(payload),
+      signal: ctrl.signal
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    return await res.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+const ERROR_MESSAGES = {
+  BAD_REQUEST: 'Please fill in all the required fields.',
+  BAD_LOCATION: 'Please choose a valid practice location.',
+  NO_REASON: 'Please explain what happened.'
+};
+
+const state = { token: null };
+
+/* ── Boot ────────────────────────────── */
+async function boot(){
+  state.token = load(TOKEN_KEY);
+  if (!state.token) return show('no-token');
+
+  try {
+    const r = await api({ action:'request_meta', token: state.token });
+    if (!r.ok){
+      return show('no-token'); // AUTH (revoked/unregistered) — same guidance applies
+    }
+    $('who').textContent = `${r.name} (${r.employee_code})`;
+    populateLocations(r.locations);
+
+    const today = new Date();
+    const p = n => String(n).padStart(2,'0');
+    $('f-date').value = `${today.getFullYear()}-${p(today.getMonth()+1)}-${p(today.getDate())}`;
+
+    show('form');
+  } catch(e){
+    setMsg($('form-msg'), 'Couldn’t connect. Please try again.', 'err');
+    show('form');
+  }
+}
+
+function populateLocations(locations){
+  const sel = $('f-loc');
+  sel.innerHTML = '';
+  locations.forEach(loc => {
+    const opt = document.createElement('option');
+    opt.value = loc.id;
+    opt.textContent = loc.label;
+    sel.appendChild(opt);
+  });
+}
+
+$('f-early-leave').addEventListener('change', () => {
+  $('departure-field').classList.toggle('hide', !$('f-early-leave').checked);
+});
+
+/* ── Submit ───────────────── */
+async function submit(){
+  const date = $('f-date').value;
+  const arrival = $('f-arrival').value;
+  const hasEarlyLeave = $('f-early-leave').checked;
+  const departure = $('f-departure').value;
+  const reason = $('f-reason').value.trim();
+
+  if (!date) return setMsg($('form-msg'), 'Please choose the practice date.');
+  if (!arrival) return setMsg($('form-msg'), 'Please enter your arrival time.');
+  if (hasEarlyLeave && !departure) return setMsg($('form-msg'), 'Please enter the time you left early.');
+  if (!reason) return setMsg($('form-msg'), 'Please explain what happened.');
+
+  const btn = $('btn-submit');
+  btn.disabled = true; btn.textContent = 'Submitting…';
+  setMsg($('form-msg'), '');
+
+  try {
+    const r = await api({
+      action: 'submit_request',
+      token: state.token,
+      business_date: date,
+      practice_loc_id: $('f-loc').value,
+      arrival_time: arrival,
+      has_early_leave: hasEarlyLeave,
+      departure_time: departure,
+      reason: reason
+    });
+    if (!r.ok){
+      if (r.error === 'AUTH') return show('no-token');
+      return setMsg($('form-msg'), ERROR_MESSAGES[r.error] || r.message || 'Something went wrong.', 'err');
+    }
+    show('done');
+  } catch(e){
+    setMsg($('form-msg'), 'Couldn’t connect. Please try again.', 'err');
+  } finally {
+    btn.disabled = false; btn.textContent = 'Submit Request';
+  }
+}
+
+/* ── Wiring ────────────────────────────── */
+$('btn-submit').onclick = submit;
+
+boot();
+</script>
+</body>
+</html>
