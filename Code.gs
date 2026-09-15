@@ -142,6 +142,7 @@ const MODE_LABEL = {
    ════════════════════════════════════════════ */
 
 function doPost(e) {
+  resetSheetCache();
   resetScheduleCache();
   try {
     if (!e || !e.postData || !e.postData.contents) {
@@ -777,19 +778,53 @@ function existsUuid(uuid) {
    6. Utilities
    ════════════════════════════════════════════ */
 
+// Request-scoped cache for the opened Spreadsheet, its Sheet objects, and
+// each sheet's header row. Nearly every helper function (authenticate(),
+// findEmployee(), findLocationByType(), getTodayEvents(), findSchedule(),
+// ...) opens its own sheet independently, so a single request like
+// handleState() or handlePunch() ends up calling SpreadsheetApp.openById()
+// and re-reading the header row many times over — pure overhead, since
+// neither the spreadsheet handle nor a sheet's header row ever changes
+// within one request (only data ROWS do, via writes). Caching just those
+// two things is safe even across a write-then-read within the same
+// request: Sheet/Range objects are live references, so a cached Sheet
+// object still reflects the latest rows when read again later. Actual data
+// rows are deliberately NOT cached here, to avoid ever serving a stale
+// snapshot to code that reads its own writes back (e.g. handleEditEvent()
+// writing a row, then getDayEvents() reading the day fresh afterward).
+// Reset at the top of every doPost() call so nothing leaks between requests
+// on a warm execution context.
+let _ss = null;
+let _sheetObjCache = null;
+let _headerCache = null;
+
+function resetSheetCache() {
+  _ss = null;
+  _sheetObjCache = {};
+  _headerCache = {};
+}
+
 function sheet(name) {
-  const sh = SpreadsheetApp.openById(CONFIG.SHEET_ID).getSheetByName(name);
+  if (!_sheetObjCache) _sheetObjCache = {};
+  if (_sheetObjCache[name]) return _sheetObjCache[name];
+  if (!_ss) _ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
+  const sh = _ss.getSheetByName(name);
   if (!sh) throw new Error('Sheet not found: ' + name + ' → run setup()');
+  _sheetObjCache[name] = sh;
   return sh;
 }
 
 /** Builds a column-name → index map from the header row (so column reordering doesn't break anything). */
 function readHeader(name) {
+  if (!_headerCache) _headerCache = {};
+  if (_headerCache[name]) return _headerCache[name];
   const sh = sheet(name);
   const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
   const col = {};
   headers.forEach((h, i) => col[String(h).trim()] = i);
-  return { sheet: sh, headers: headers, col: col };
+  const result = { sheet: sh, headers: headers, col: col };
+  _headerCache[name] = result;
+  return result;
 }
 
 function readTable(name) {
@@ -1176,6 +1211,7 @@ function voidEvent() {
  *   replaced, never duplicated).
  */
 function buildWeeklySummary() {
+  resetSheetCache();    // avoid a warm execution context serving another run's stale sheet reads
   resetScheduleCache(); // avoid a warm execution context serving another run's stale schedule reads
   const today = businessDate(new Date());
   const thisMonday = mondayOfWeek(today);
