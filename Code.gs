@@ -79,6 +79,7 @@ const SHEETS = {
   DEVICES: 'devices',
   LOCATIONS: 'locations',
   EVENTS: 'punch_events',
+  EVENTS_ARCHIVE: 'punch_events_archive', // rows older than 6 months land here — see archiveOldPunchEvents()
   CORRECTIONS: 'corrections',
   SCHEDULES_LEGACY: 'schedules', // pre-category-split sheet, kept only for migrateSchedulesToCategories()
   WEEKLY_SUMMARY: 'weekly_summary',
@@ -964,15 +965,18 @@ function setup() {
   const ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
   ss.setSpreadsheetTimeZone(CONFIG.TZ);
 
+  const eventColumns = ['event_id', 'employee_code', 'employee_name', 'loc_id', 'loc_name',
+                        'punched_at', 'punch_type', 'practice_loc_id', 'practice_loc_name',
+                        'business_date', 'lat', 'lng', 'accuracy_m', 'distance_m', 'geo_status',
+                        'address', 'client_uuid', 'client_time', 'user_agent', 'is_voided',
+                        'worked_hours', 'worked_minutes'];
+
   const defs = {
     [SHEETS.EMPLOYEES]: ['employee_code', 'name', 'email', 'pin_salt', 'pin_hash', 'is_active'],
     [SHEETS.DEVICES]:   ['token', 'employee_code', 'registered_at', 'last_used_at', 'label', 'is_active'],
     [SHEETS.LOCATIONS]: ['loc_id', 'name', 'type', 'lat', 'lng', 'radius_m', 'is_active'],
-    [SHEETS.EVENTS]:    ['event_id', 'employee_code', 'employee_name', 'loc_id', 'loc_name',
-                         'punched_at', 'punch_type', 'practice_loc_id', 'practice_loc_name',
-                         'business_date', 'lat', 'lng', 'accuracy_m', 'distance_m', 'geo_status',
-                         'address', 'client_uuid', 'client_time', 'user_agent', 'is_voided',
-                         'worked_hours', 'worked_minutes'],
+    [SHEETS.EVENTS]: eventColumns,
+    [SHEETS.EVENTS_ARCHIVE]: eventColumns,
     [SHEETS.CORRECTIONS]: ['correction_id', 'original_event_id', 'employee_code', 'field',
                            'old_value', 'new_value', 'reason', 'requested_by', 'approved_by', 'corrected_at'],
     [SHEETS.WEEKLY_SUMMARY]: ['week_start', 'week_end', 'employee_code', 'employee_name',
@@ -1147,6 +1151,23 @@ function resetPin() {
   Logger.log(code + ' new PIN: ' + pin);
 }
 
+/**
+ * URGENT, run this now if punches are failing with a row-limit error.
+ * Google Sheets caps each sheet's grid at however many rows it currently
+ * has (appendRow() needs room past the last row to add a new one); a busy
+ * punch_events sheet can fill that grid up over time. This grows the grid
+ * to at least minRows without touching any existing data — safe to re-run.
+ */
+function expandSheetCapacity(sheetName, minRows) {
+  const name = sheetName || SHEETS.EVENTS;
+  const target = minRows || 1500;
+  const sh = SpreadsheetApp.openById(CONFIG.SHEET_ID).getSheetByName(name);
+  if (!sh) return Logger.log('Sheet not found: ' + name);
+  const current = sh.getMaxRows();
+  if (current < target) sh.insertRowsAfter(current, target - current);
+  Logger.log(name + ' now has ' + sh.getMaxRows() + ' rows (was ' + current + ').');
+}
+
 /** Deactivates a device. Run this when a device is lost or replaced. */
 function deactivateDevices() {
   const code = 'E001';   // ← change to the target employee code
@@ -1319,6 +1340,111 @@ function installWeeklyTrigger() {
 
 
 /* ════════════════════════════════════════════
+   8b. punch_events archival (keeps the live sheet from growing forever)
+   ════════════════════════════════════════════ */
+
+/**
+ * Moves every punch_events row from before the current month into
+ * punch_events_archive, then rewrites punch_events to hold only what's
+ * left — this is what keeps the live sheet's row count (and therefore its
+ * Google Sheets row-limit headroom) bounded to roughly one month's worth
+ * (~1200 rows at current volume) instead of growing without bound. This
+ * has to match the monthly cadence it's installed at (installArchiveTrigger()):
+ * archiving by a fixed "6 months ago" cutoff on a monthly trigger would let
+ * the live sheet grow toward 6 months of rows before the cutoff ever
+ * caught up to it, which is what originally motivated this fix. Nothing is
+ * deleted: archived rows are still readable by opening punch_events_archive
+ * directly, or through handleReport()/buildAttendanceReportData() — see
+ * readEventRowsInRange() — which read into the archive automatically for a
+ * date range reaching back before the current month. The weekly-summary,
+ * correction, and request tools still only ever read punch_events, since
+ * they only ever deal with recent/current dates. Always called by
+ * monthlyMaintenance() before archiving runs, so last month's standalone
+ * report snapshot (generateMonthEndReport()) is captured first. Safe to
+ * run by hand too.
+ */
+function archiveOldPunchEvents() {
+  const now = new Date();
+  const cutoff = new Date(now.getFullYear(), now.getMonth(), 1); // the 1st of the current month
+  const cutoffStr = Utilities.formatDate(cutoff, CONFIG.TZ, 'yyyy-MM-dd');
+
+  const t = readHeader(SHEETS.EVENTS);
+  const lastRow = t.sheet.getLastRow();
+  if (lastRow < 2) return Logger.log('punch_events has no data — nothing to archive.');
+
+  const values = t.sheet.getRange(2, 1, lastRow - 1, t.headers.length).getValues();
+  const keep = [];
+  const toArchive = [];
+  values.forEach(r => {
+    const bDate = normalizeDateStr(r[t.col.business_date]);
+    (bDate && bDate < cutoffStr ? toArchive : keep).push(r);
+  });
+
+  if (!toArchive.length) {
+    return Logger.log('Nothing older than ' + cutoffStr + ' — nothing to archive.');
+  }
+
+  const archiveSheet = sheet(SHEETS.EVENTS_ARCHIVE);
+  const archiveLastRow = archiveSheet.getLastRow();
+  archiveSheet.getRange(archiveLastRow + 1, 1, toArchive.length, t.headers.length).setValues(toArchive);
+
+  t.sheet.getRange(2, 1, lastRow - 1, t.headers.length).clearContent();
+  if (keep.length) {
+    t.sheet.getRange(2, 1, keep.length, t.headers.length).setValues(keep);
+  }
+
+  const minRows = keep.length + 1 + 3000; // header + what's left + headroom until the next run
+  if (t.sheet.getMaxRows() < minRows) t.sheet.insertRowsAfter(t.sheet.getMaxRows(), minRows - t.sheet.getMaxRows());
+
+  Logger.log('Archived ' + toArchive.length + ' row(s) older than ' + cutoffStr + '. ' +
+             'punch_events now has ' + keep.length + ' data row(s), grid capacity ' + t.sheet.getMaxRows() + '.');
+}
+
+/**
+ * Everything that needs to happen on the 1st of each month, in order:
+ * first snapshot last month into its own permanent report sheet
+ * (generateMonthEndReport()), then archive last month's raw punches out of
+ * punch_events (archiveOldPunchEvents()). This ordering is a belt-and-
+ * suspenders safeguard, not a hard requirement — buildAttendanceReportData()
+ * can read punch_events_archive too (see readEventRowsInRange()), so
+ * running these the other way around would still produce a correct
+ * report. installArchiveTrigger() points its monthly trigger at this
+ * function.
+ */
+function monthlyMaintenance() {
+  generateMonthEndReport();
+  archiveOldPunchEvents();
+}
+
+/**
+ * Sets up a trigger that automatically runs monthlyMaintenance() on the
+ * 1st of every month at 3am (CONFIG.TZ). Run this once, initially — and
+ * again after any update that changes what monthlyMaintenance() does,
+ * since an existing trigger just keeps calling the same handler function
+ * name forever otherwise. Any existing trigger pointed at
+ * monthlyMaintenance() or the older archiveOldPunchEvents() (from before
+ * the month-end report was added) is deleted first, so running this again
+ * never creates a duplicate and always ends up targeting the current
+ * function.
+ */
+function installArchiveTrigger() {
+  ScriptApp.getProjectTriggers().forEach(tr => {
+    const fn = tr.getHandlerFunction();
+    if (fn === 'monthlyMaintenance' || fn === 'archiveOldPunchEvents') ScriptApp.deleteTrigger(tr);
+  });
+
+  ScriptApp.newTrigger('monthlyMaintenance')
+    .timeBased()
+    .onMonthDay(1)
+    .atHour(3)
+    .inTimezone(CONFIG.TZ)
+    .create();
+
+  Logger.log('monthlyMaintenance() (month-end report + archive) will now run automatically on the 1st of every month at 3am (' + CONFIG.TZ + ').');
+}
+
+
+/* ════════════════════════════════════════════
    9. Attendance report (admin, password-protected)
    ════════════════════════════════════════════ */
 
@@ -1381,6 +1507,35 @@ function handleGetNotice(req) {
 }
 
 /**
+ * Returns raw punch_events row values covering [startDate, endDate]. Reads
+ * punch_events itself, and — only when the range reaches back before the
+ * start of the current month — also punch_events_archive, since that's
+ * where archiveOldPunchEvents() moves everything older each month (see its
+ * docs). Both sheets share identical columns, so the same col map applies
+ * to every returned row regardless of which sheet it came from. Report
+ * generation is the only place this is used; the live punch/state/
+ * correction/request flows never need anything but the current month.
+ */
+function readEventRowsInRange(startDate) {
+  const t = readHeader(SHEETS.EVENTS);
+  const lastRow = t.sheet.getLastRow();
+  let values = lastRow >= 2 ? t.sheet.getRange(2, 1, lastRow - 1, t.headers.length).getValues() : [];
+
+  const now = new Date();
+  const monthStart = Utilities.formatDate(new Date(now.getFullYear(), now.getMonth(), 1), CONFIG.TZ, 'yyyy-MM-dd');
+  if (startDate < monthStart) {
+    const archiveSheet = sheet(SHEETS.EVENTS_ARCHIVE);
+    const archiveLastRow = archiveSheet.getLastRow();
+    if (archiveLastRow >= 2) {
+      const archiveValues = archiveSheet.getRange(2, 1, archiveLastRow - 1, t.headers.length).getValues();
+      values = archiveValues.concat(values);
+    }
+  }
+
+  return { col: t.col, values: values };
+}
+
+/**
  * Returns the filter options (employees) for the report screen's dropdowns.
  * Requires the report password — this is the only data report.html can see
  * before authenticating.
@@ -1399,7 +1554,12 @@ function handleReportMeta(req) {
 
 /**
  * Builds the attendance report for a date range and writes it to the
- * "report" sheet, overwriting whatever was there before. Filters:
+ * "report" sheet, overwriting whatever was there before. The date range
+ * can reach back further than the current month — events are read via
+ * readEventRowsInRange(), which also pulls from punch_events_archive when
+ * needed, so a month already swept out of punch_events by
+ * archiveOldPunchEvents() can still be reported on (just not edited — the
+ * correction/request tools don't reach into the archive). Filters:
  *   - employee_codes    : array of specific employee codes to include.
  *   - employee_prefixes : array of single letters (e.g. 'E'); every employee
  *                         whose code starts with one of them is included.
@@ -1465,13 +1625,11 @@ function handleReport(req) {
   if (!startDate || !endDate || startDate > endDate) {
     return { ok: false, error: 'BAD_RANGE', message: 'Please select a valid date range.' };
   }
-
-  const dates = [];
-  for (let d = startDate; d <= endDate; d = addDays(d, 1)) {
-    dates.push(d);
-    if (dates.length > 366) {
-      return { ok: false, error: 'RANGE_TOO_LARGE', message: 'Please select a range of 366 days or fewer.' };
-    }
+  const dayCount = Math.round(
+    (Utilities.parseDate(endDate, CONFIG.TZ, 'yyyy-MM-dd') - Utilities.parseDate(startDate, CONFIG.TZ, 'yyyy-MM-dd'))
+    / 86400000) + 1;
+  if (dayCount > 366) {
+    return { ok: false, error: 'RANGE_TOO_LARGE', message: 'Please select a range of 366 days or fewer.' };
   }
 
   // Employees can be picked individually (employee_codes) and/or by the
@@ -1482,6 +1640,47 @@ function handleReport(req) {
     .map(c => String(c).trim().toUpperCase()).filter(Boolean);
   const empPrefixFilter = (Array.isArray(req.employee_prefixes) ? req.employee_prefixes : [])
     .map(c => String(c).trim().toUpperCase()).filter(Boolean);
+
+  const report = buildAttendanceReportData(startDate, endDate, empCodesFilter, empPrefixFilter);
+  if (!report.dataRows.length) {
+    return { ok: false, error: 'NO_DATA', message: 'No matching players were found for this filter.' };
+  }
+
+  const empDescParts = [];
+  if (empCodesFilter.length) empDescParts.push(empCodesFilter.join(', '));
+  if (empPrefixFilter.length) empDescParts.push(empPrefixFilter.map(p => p + '*').join(', '));
+  const empDesc = empDescParts.length ? empDescParts.join(' + ') : 'All employees';
+
+  const title = 'Attendance Report — ' + empDesc + ' — ' + startDate + ' to ' + endDate +
+                ' (generated ' + Utilities.formatDate(new Date(), CONFIG.TZ, 'yyyy-MM-dd HH:mm') + ')';
+  const sh = writeReportSheet('report', title, report);
+
+  return {
+    ok: true,
+    sheet_url: SpreadsheetApp.openById(CONFIG.SHEET_ID).getUrl() + '#gid=' + sh.getSheetId(),
+    employee_count: report.dataRows.length,
+    date_count: report.dateCount
+  };
+}
+
+/**
+ * The actual report computation, shared by handleReport() (ad-hoc, written
+ * to the "report" sheet that gets overwritten every time) and
+ * generateMonthEndReport() (automatic, written to its own permanent
+ * "report_YYYY-MM" sheet — see writeReportSheet()). Reads raw events via
+ * readEventRowsInRange(), which transparently reaches into
+ * punch_events_archive when the range goes back further than the current
+ * month, so a report can still be generated for a month that's already
+ * been archived.
+ *
+ * empCodesFilter/empPrefixFilter: see handleReport()'s own docstring for
+ * how they combine; pass both as [] for "every active employee".
+ *
+ * Returns { headerRow, dataRows, columnCount, dateCount } — see
+ * handleReport()'s docstring for what the columns/Total Hours/Attendance
+ * Rate mean.
+ */
+function buildAttendanceReportData(startDate, endDate, empCodesFilter, empPrefixFilter) {
   const hasEmpFilter = empCodesFilter.length > 0 || empPrefixFilter.length > 0;
 
   function employeeMatches(code) {
@@ -1489,6 +1688,9 @@ function handleReport(req) {
     const upper = code.toUpperCase();
     return empCodesFilter.indexOf(upper) !== -1 || empPrefixFilter.indexOf(upper.charAt(0)) !== -1;
   }
+
+  const dates = [];
+  for (let d = startDate; d <= endDate; d = addDays(d, 1)) dates.push(d);
 
   // Which categories' schedule sheets can possibly contain a relevant date/
   // session — with no employee filter, every category; with a filter, only
@@ -1502,35 +1704,30 @@ function handleReport(req) {
           empCodesFilter.some(c => c.charAt(0) === cat))
       ));
 
-  const t = readHeader(SHEETS.EVENTS);
-  const lastRow = t.sheet.getLastRow();
-
   // Pass 1: collect every non-voided event in range, grouped by (date, employee),
   // regardless of the location filter — pairing Check In / Leave Early correctly
   // requires seeing the whole day.
   const eventsByDayEmployee = {}; // 'date|code' -> [{type, punched_at, practice_loc_id}]
   const employeeNames = {};       // employee_code -> name
 
-  if (lastRow >= 2) {
-    const values = t.sheet.getRange(2, 1, lastRow - 1, t.headers.length).getValues();
-    values.forEach(r => {
-      if (truthy(r[t.col.is_voided])) return;
+  const evt = readEventRowsInRange(startDate);
+  evt.values.forEach(r => {
+    if (truthy(r[evt.col.is_voided])) return;
 
-      const bDate = normalizeDateStr(r[t.col.business_date]);
-      if (bDate < startDate || bDate > endDate) return;
+    const bDate = normalizeDateStr(r[evt.col.business_date]);
+    if (bDate < startDate || bDate > endDate) return;
 
-      const code = String(r[t.col.employee_code]).trim();
-      if (!code) return;
+    const code = String(r[evt.col.employee_code]).trim();
+    if (!code) return;
 
-      employeeNames[code] = String(r[t.col.employee_name]);
-      const key = bDate + '|' + code;
-      (eventsByDayEmployee[key] = eventsByDayEmployee[key] || []).push({
-        type: String(r[t.col.punch_type]),
-        punched_at: new Date(r[t.col.punched_at]),
-        practice_loc_id: String(r[t.col.practice_loc_id] || '')
-      });
+    employeeNames[code] = String(r[evt.col.employee_name]);
+    const key = bDate + '|' + code;
+    (eventsByDayEmployee[key] = eventsByDayEmployee[key] || []).push({
+      type: String(r[evt.col.punch_type]),
+      punched_at: new Date(r[evt.col.punched_at]),
+      practice_loc_id: String(r[evt.col.practice_loc_id] || '')
     });
-  }
+  });
 
   // Pass 2: build the column list — one per date normally, or one per
   // session (see distinctSessionStarts()) on a date with 2+ practices. A
@@ -1593,9 +1790,6 @@ function handleReport(req) {
     });
 
   const employeeCodes = Object.keys(perEmployeeCol).sort();
-  if (!employeeCodes.length) {
-    return { ok: false, error: 'NO_DATA', message: 'No matching players were found for this filter.' };
-  }
 
   const headerRow = ['Employee'].concat(columns.map(c => c.label), ['Total Hours', 'Attendance Rate']);
   const dataRows = employeeCodes.map(code => {
@@ -1622,37 +1816,67 @@ function handleReport(req) {
     );
   });
 
-  const empDescParts = [];
-  if (empCodesFilter.length) empDescParts.push(empCodesFilter.join(', '));
-  if (empPrefixFilter.length) empDescParts.push(empPrefixFilter.map(p => p + '*').join(', '));
-  const empDesc = empDescParts.length ? empDescParts.join(' + ') : 'All employees';
+  return { headerRow: headerRow, dataRows: dataRows, columnCount: columns.length, dateCount: dates.length };
+}
 
+/**
+ * Writes a built report ({headerRow, dataRows, columnCount}, from
+ * buildAttendanceReportData()) into the given sheet, clearing it first —
+ * creates the sheet if it doesn't already exist. Same layout/number
+ * formatting handleReport() has always used.
+ */
+function writeReportSheet(sheetName, title, report) {
   const ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
-  let sh = ss.getSheetByName('report');
-  if (!sh) sh = ss.insertSheet('report');
+  let sh = ss.getSheetByName(sheetName);
+  if (!sh) sh = ss.insertSheet(sheetName);
   sh.clear();
 
-  const title = 'Attendance Report — ' + empDesc + ' — ' + startDate + ' to ' + endDate +
-                ' (generated ' + Utilities.formatDate(new Date(), CONFIG.TZ, 'yyyy-MM-dd HH:mm') + ')';
   sh.getRange(1, 1).setValue(title);
-  sh.getRange(2, 1, 1, headerRow.length).setValues([headerRow]);
-  sh.getRange(2, 1, 1, headerRow.length).setFontWeight('bold');
-  if (dataRows.length) {
-    sh.getRange(3, 1, dataRows.length, headerRow.length).setValues(dataRows);
+  sh.getRange(2, 1, 1, report.headerRow.length).setValues([report.headerRow]);
+  sh.getRange(2, 1, 1, report.headerRow.length).setFontWeight('bold');
+  if (report.dataRows.length) {
+    sh.getRange(3, 1, report.dataRows.length, report.headerRow.length).setValues(report.dataRows);
     // Force every session column plus Total Hours to always show 2 decimal
     // places (e.g. "3.00" instead of "3"), so partial-hour/minute detail
     // is visible even for whole-hour totals.
-    const hourColumns = columns.length + 1; // each session column + Total Hours
-    sh.getRange(3, 2, dataRows.length, hourColumns).setNumberFormat('0.00');
+    const hourColumns = report.columnCount + 1; // each session column + Total Hours
+    sh.getRange(3, 2, report.dataRows.length, hourColumns).setNumberFormat('0.00');
   }
   sh.setFrozenRows(2);
+  return sh;
+}
 
-  return {
-    ok: true,
-    sheet_url: ss.getUrl() + '#gid=' + sh.getSheetId(),
-    employee_count: dataRows.length,
-    date_count: dates.length
-  };
+/**
+ * Automatically generates a full attendance report (every active player,
+ * no filters) for the month that just ended, and saves it to its own
+ * permanent sheet named "report_YYYY-MM" — unlike the "report" sheet,
+ * which handleReport() overwrites every time an admin runs an ad-hoc
+ * report, this sheet is never overwritten, so each month's snapshot stays
+ * available even after that month's raw punches get archived out of
+ * punch_events. Called by monthlyMaintenance(), before
+ * archiveOldPunchEvents() — see installArchiveTrigger().
+ */
+function generateMonthEndReport() {
+  const now = new Date();
+  const thisMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  const lastMonthEnd = new Date(thisMonthStart.getTime() - 86400000);
+  const lastMonthStart = new Date(lastMonthEnd.getFullYear(), lastMonthEnd.getMonth(), 1);
+
+  const startDate = Utilities.formatDate(lastMonthStart, CONFIG.TZ, 'yyyy-MM-dd');
+  const endDate = Utilities.formatDate(lastMonthEnd, CONFIG.TZ, 'yyyy-MM-dd');
+  const monthLabel = Utilities.formatDate(lastMonthStart, CONFIG.TZ, 'yyyy-MM');
+
+  const report = buildAttendanceReportData(startDate, endDate, [], []);
+  if (!report.dataRows.length) {
+    Logger.log('No data for ' + monthLabel + ' — month-end report skipped.');
+    return;
+  }
+
+  const title = 'Attendance Report — All employees — ' + startDate + ' to ' + endDate +
+                ' (month-end, generated ' + Utilities.formatDate(new Date(), CONFIG.TZ, 'yyyy-MM-dd HH:mm') + ')';
+  writeReportSheet('report_' + monthLabel, title, report);
+
+  Logger.log('Month-end report for ' + monthLabel + ' saved to sheet "report_' + monthLabel + '".');
 }
 
 
