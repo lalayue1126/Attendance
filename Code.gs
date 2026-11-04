@@ -690,16 +690,28 @@ function splitBySession(dayEvents, starts) {
  * and time, so whichever punch was most recent is what determines the day's
  * total — the timestamp also disambiguates between multiple same-day sessions
  * at the same location, e.g. a morning and an evening practice at AQC).
+ *
+ * If nothing actually matched (schedule.matched is false — no real schedule
+ * row exists for this employee on this date, only the CONFIG fallback),
+ * this returns 0 hours rather than crediting the fallback's default window.
+ * That fallback exists for handlePunch()'s live confirmation screen, where
+ * showing *something* sensible before that day's schedule has been entered
+ * is useful — but here, for report/weekly-summary aggregation and for
+ * refreshing a punch's worked_hours snapshot after a correction, crediting
+ * it would silently invent hours (commonly the full default, e.g. 8h) for
+ * a day nothing was actually scheduled for this employee.
  */
 function recomputeDayWorked(employeeCode, businessDateStr, dayEvents) {
-  if (!dayEvents.length) return { hours: 0, minutes: 0 };
+  if (!dayEvents.length) return { hours: 0, minutes: 0, matched: false };
   const sorted = dayEvents.slice().sort((a, b) => a.punched_at - b.punched_at);
   const lastEvent = sorted[sorted.length - 1];
   const schedule = findSchedule(businessDateStr, employeeCode, lastEvent.practice_loc_id, lastEvent.punched_at);
+  if (!schedule.matched) return { hours: 0, minutes: 0, matched: false };
   const worked = computeDayWorked(schedule, businessDateStr, sorted);
   return {
     hours: isNum(worked.hours) ? worked.hours : 0,
-    minutes: isNum(worked.minutes) ? worked.minutes : 0
+    minutes: isNum(worked.minutes) ? worked.minutes : 0,
+    matched: true
   };
 }
 
@@ -1412,6 +1424,8 @@ function archiveOldPunchEvents() {
  * function.
  */
 function monthlyMaintenance() {
+  resetSheetCache();    // avoid a warm execution context serving another run's stale sheet reads
+  resetScheduleCache(); // avoid a warm execution context serving another run's stale schedule reads
   generateMonthEndReport();
   archiveOldPunchEvents();
 }
@@ -1571,9 +1585,10 @@ function handleReportMeta(req) {
  * shows up as 0 hours / 0% rather than being silently omitted.
  *
  * Layout: one row per employee, one column per *session* in the range, plus
- * Total Hours / Attendance Rate columns. Every session column and Total
- * Hours are formatted to always show 2 decimal places (e.g. "3.00"), since
- * that's precise enough to distinguish individual minutes.
+ * Total Hours / Practices Held / Practices Attended / Attendance Rate
+ * columns. Every session column and Total Hours are formatted to always
+ * show 2 decimal places (e.g. "3.00"), since that's precise enough to
+ * distinguish individual minutes.
  *
  * A date with no practice scheduled at all (across the categories implied
  * by the employee filter — see distinctSessionStarts()) gets no column at
@@ -1600,20 +1615,22 @@ function handleReportMeta(req) {
  *                     report is generated. A column only shows hours if the
  *                     employee has at least one non-voided punch in that
  *                     session.
- *   - Attendance Rate: count-based, not hours-based. For every session
+ *   - Practices Held    : count-based, not hours-based. For every session
  *                     column, findSchedule() (same employee/location
  *                     priority rules as the live worked-hours calculation,
  *                     anchored to that session's own start time) checks
  *                     whether an actual practice was scheduled for that
  *                     employee in that session (schedule.matched — the
  *                     CONFIG fallback used when nothing matches does NOT
- *                     count as a scheduled practice). That count is the
- *                     denominator. The numerator is how many of those
- *                     scheduled sessions the employee actually has a punch
- *                     in. Rate = attended / scheduled sessions, as a
- *                     percentage — arriving late or leaving early doesn't
- *                     reduce it, only being fully absent from a scheduled
- *                     session does.
+ *                     count as a scheduled practice). This is that count —
+ *                     how many sessions this employee had scheduled across
+ *                     the whole range.
+ *   - Practices Attended: how many of those Practices Held sessions the
+ *                     employee actually has a punch in — arriving late or
+ *                     leaving early doesn't reduce it, only being fully
+ *                     absent from a scheduled session does.
+ *   - Attendance Rate: Practices Attended / Practices Held, as a
+ *                     percentage (blank if Practices Held is 0).
  */
 function handleReport(req) {
   if (!checkReportPassword(req.password)) {
@@ -1770,7 +1787,9 @@ function buildAttendanceReportData(startDate, endDate, empCodesFilter, empPrefix
         const label = d + '(' + (i + 1) + ')';
         const sessionStart = Utilities.parseDate(d + ' ' + starts[i], CONFIG.TZ, 'yyyy-MM-dd HH:mm');
         const schedule = findSchedule(d, code, '', sessionStart);
-        const worked = computeDayWorked(schedule, d, bucketEvents);
+        // No real schedule for this employee in this session — don't credit
+        // the CONFIG fallback's hours (see recomputeDayWorked()'s docs for why).
+        const worked = schedule.matched ? computeDayWorked(schedule, d, bucketEvents) : { hours: 0, minutes: 0 };
         perEmployeeCol[code][label] = isNum(worked.hours) ? Number(worked.hours) : 0;
         colIncluded[label + '|' + code] = true;
       });
@@ -1791,7 +1810,8 @@ function buildAttendanceReportData(startDate, endDate, empCodesFilter, empPrefix
 
   const employeeCodes = Object.keys(perEmployeeCol).sort();
 
-  const headerRow = ['Employee'].concat(columns.map(c => c.label), ['Total Hours', 'Attendance Rate']);
+  const headerRow = ['Employee'].concat(columns.map(c => c.label),
+    ['Total Hours', 'Practices Held', 'Practices Attended', 'Attendance Rate']);
   const dataRows = employeeCodes.map(code => {
     let totalActual = 0;
     let scheduledCount = 0;
@@ -1812,7 +1832,7 @@ function buildAttendanceReportData(startDate, endDate, empCodesFilter, empPrefix
     const rate = scheduledCount > 0 ? Math.round((attendedCount / scheduledCount) * 1000) / 10 + '%' : '';
     return [employeeNames[code] || code].concat(
       cells,
-      [Math.round(totalActual * 100) / 100, rate]
+      [Math.round(totalActual * 100) / 100, scheduledCount, attendedCount, rate]
     );
   });
 

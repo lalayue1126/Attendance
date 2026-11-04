@@ -175,9 +175,9 @@ function esc(s){
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
-async function api(payload){
+async function api(payload, timeoutMs){
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), CONFIG.FETCH_TIMEOUT_MS);
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs || CONFIG.FETCH_TIMEOUT_MS);
   try {
     const res = await fetch(CONFIG.API_URL, {
       method: 'POST',
@@ -317,6 +317,9 @@ async function generate(){
   const emp = collectPlayerSelection();
 
   try {
+    // A wide date range covering every player can genuinely take a while
+    // to compute server-side (well past the usual request's timeout), so
+    // this one gets a much longer allowance before giving up on it.
     const r = await api({
       action: 'report',
       password: state.password,
@@ -324,7 +327,7 @@ async function generate(){
       employee_prefixes: emp.prefixes,
       start_date: start,
       end_date: end
-    });
+    }, 100000);
 
     if (!r.ok){
       const m = {
@@ -341,7 +344,16 @@ async function generate(){
       `<p><a href="${r.sheet_url}" target="_blank" rel="noopener">Open the spreadsheet</a></p>`;
     show('result');
   } catch(e){
-    setMsg($('form-msg'), 'Couldn’t connect. Please try again.', 'err');
+    // The request can time out client-side even when the report finished
+    // generating on the server — Apps Script keeps running after the
+    // browser gives up waiting. So this isn't necessarily a failure.
+    if (e.name === 'AbortError'){
+      setMsg($('form-msg'),
+        'This is taking longer than usual to confirm, but it may well have finished — large reports can take a while. ' +
+        'Please check the report sheet in a moment before trying again.', 'warn');
+    } else {
+      setMsg($('form-msg'), 'Couldn’t connect. Please try again.', 'err');
+    }
   } finally {
     btn.disabled = false; btn.textContent = 'Generate Report';
   }
