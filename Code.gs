@@ -71,7 +71,12 @@ const CONFIG = {
   // Fallback schedule used only when the schedules sheet has no row for that day
   // (a safety net for the normal workflow of entering hours per date by hand).
   DEFAULT_SCHEDULED_START: '09:00',
-  DEFAULT_SCHEDULED_HOURS: 8
+  DEFAULT_SCHEDULED_HOURS: 8,
+
+  // The FIRST practice of a day accepts punches from this many minutes before
+  // its start; every later practice that day opens when the previous one ends.
+  // Used to decide which session a punch belongs to (live punch and report).
+  CHECKIN_LEAD_MIN: 90
 };
 
 const SHEETS = {
@@ -81,7 +86,6 @@ const SHEETS = {
   EVENTS: 'punch_events',
   EVENTS_ARCHIVE: 'punch_events_archive', // rows older than 6 months land here — see archiveOldPunchEvents()
   CORRECTIONS: 'corrections',
-  SCHEDULES_LEGACY: 'schedules', // pre-category-split sheet, kept only for migrateSchedulesToCategories()
   WEEKLY_SUMMARY: 'weekly_summary',
   REQUESTS: 'punch_requests'
 };
@@ -545,9 +549,24 @@ function findSchedule(businessDateStr, employeeCode, practiceLocId, referenceTim
 
     let diff = 0;
     if (referenceTime) {
-      const rowStart = Utilities.parseDate(
-        businessDateStr + ' ' + normalizeTimeStr(r.scheduled_start), CONFIG.TZ, 'yyyy-MM-dd HH:mm');
-      diff = Math.abs(referenceTime.getTime() - rowStart.getTime());
+      const rowStart = parseDateTime(businessDateStr, normalizeTimeStr(r.scheduled_start));
+      // A session is "open" for a punch from the END of the previous session
+      // that day (same sheet), or CHECKIN_LEAD_MIN before its start if it is
+      // the first one. Among open sessions the latest-starting one wins
+      // (smallest diff); if none is open yet, the earliest upcoming wins.
+      let prevEnd = -Infinity;
+      for (const o of t.rows) {
+        if (normalizeDateStr(o.business_date) !== businessDateStr || !isValidSchedule(o)) continue;
+        const oStart = parseDateTime(businessDateStr, normalizeTimeStr(o.scheduled_start));
+        if (oStart.getTime() >= rowStart.getTime()) continue;
+        prevEnd = Math.max(prevEnd, oStart.getTime() + Number(o.scheduled_hours) * 3600000);
+      }
+      const openFrom = prevEnd === -Infinity
+        ? rowStart.getTime() - CONFIG.CHECKIN_LEAD_MIN * 60000
+        : Math.min(prevEnd, rowStart.getTime());
+      diff = referenceTime.getTime() >= openFrom
+        ? referenceTime.getTime() - openFrom
+        : 1e15 + (rowStart.getTime() - referenceTime.getTime());
     }
 
     if (score > bestScore) {
@@ -593,7 +612,7 @@ function computeDayWorked(schedule, businessDateStr, events) {
   const hours = Number(schedule.scheduled_hours);
   if (!startStr || !isNum(hours)) return { hours: '', minutes: '' };
 
-  const start = Utilities.parseDate(businessDateStr + ' ' + startStr, CONFIG.TZ, 'yyyy-MM-dd HH:mm');
+  const start = parseDateTime(businessDateStr, startStr);
   const end = new Date(start.getTime() + hours * 3600000);
 
   const sorted = events.slice().sort((a, b) => a.punched_at - b.punched_at);
@@ -646,26 +665,53 @@ function distinctSessionStarts(businessDateStr, categories) {
 }
 
 /**
- * Splits one day's full event list into one sub-list per session, by the
- * ORDER of Check In punches rather than a time-of-day threshold: the
- * employee's 1st Check In of the day (and everything up to their 2nd Check
- * In) is session 1, their 2nd Check In (and everything up to their 3rd) is
- * session 2, and so on. This is what actually tells two practices apart —
- * a player only checks in once per practice they attend, regardless of
- * exactly when that practice happens to start. Anything before the first
- * Check In (a stray Leave Early with nothing preceding it, in malformed
- * data) falls back to session 1. A Check In beyond the number of scheduled
- * sessions that day is folded into the last session rather than dropped.
+ * End time (epoch ms) of each session in `starts` (as returned by
+ * distinctSessionStarts(), same order): start + the longest scheduled_hours
+ * among rows sharing that start.
  */
-function splitBySession(dayEvents, starts) {
+function distinctSessionEnds(businessDateStr, categories, starts) {
+  const maxHours = {};
+  categories.forEach(cat => {
+    getScheduleTable(scheduleSheetName(cat)).rows.forEach(r => {
+      if (normalizeDateStr(r.business_date) !== businessDateStr || !isValidSchedule(r)) return;
+      const k = padTimeStr(r.scheduled_start);
+      maxHours[k] = Math.max(maxHours[k] || 0, Number(r.scheduled_hours));
+    });
+  });
+  return starts.map(s =>
+    parseDateTime(businessDateStr, s).getTime() +
+    (maxHours[s] || 0) * 3600000);
+}
+
+/**
+ * Splits one day's full event list into one sub-list per session. A Check
+ * In belongs to the latest session that is already "open" for it: session 1
+ * opens CONFIG.CHECKIN_LEAD_MIN (90 min) before its start; every later
+ * session opens when the previous session ENDS (start + hours). A Check In
+ * earlier than every window goes to session 1. Leave Early punches stay
+ * with the session of the Check In before them, and the session index never
+ * moves backwards within a day.
+ *
+ * endsMs: end time (epoch ms) of each session in `starts`, same order — see
+ * distinctSessionEnds().
+ */
+function splitBySession(dayEvents, starts, businessDateStr, endsMs) {
   const sorted = dayEvents.slice().sort((a, b) => a.punched_at - b.punched_at);
   const buckets = starts.map(() => []);
+  const openFrom = starts.map((s, i) => {
+    const startMs = parseDateTime(businessDateStr, s).getTime();
+    return i === 0 ? startMs - CONFIG.CHECKIN_LEAD_MIN * 60000 : Math.min(endsMs[i - 1], startMs);
+  });
   let idx = 0;
-  let sawFirstIn = false;
   sorted.forEach(ev => {
     if (ev.type === 'IN') {
-      if (sawFirstIn) idx = Math.min(idx + 1, starts.length - 1);
-      sawFirstIn = true;
+      // A Check In belongs to the latest session already open for it
+      // (CHECKIN_LEAD_MIN before start); earlier than all → session 1.
+      let target = 0;
+      for (let i = 0; i < starts.length; i++) {
+        if (ev.punched_at.getTime() >= openFrom[i]) target = i;
+      }
+      idx = Math.max(idx, target); // never move backwards within a day
     }
     buckets[idx].push(ev);
   });
@@ -907,6 +953,11 @@ function normalizeDateStr(v) {
   return String(v || '').trim();
 }
 
+/** Parses a business date ('yyyy-MM-dd') plus a time ('HH:mm') in the script timezone. */
+function parseDateTime(dateStr, timeStr) {
+  return Utilities.parseDate(dateStr + ' ' + timeStr, CONFIG.TZ, 'yyyy-MM-dd HH:mm');
+}
+
 /** Time cells can also come back as a Date object (1899-12-30 + time), so normalize to HH:mm. */
 function normalizeTimeStr(v) {
   if (v instanceof Date) return Utilities.formatDate(v, CONFIG.TZ, 'HH:mm');
@@ -1001,7 +1052,6 @@ function setup() {
   };
 
   const scheduleColumns = ['business_date', 'employee_code', 'practice_loc_id', 'scheduled_start', 'scheduled_hours', 'note'];
-  defs[SHEETS.SCHEDULES_LEGACY] = scheduleColumns; // kept only so migrateSchedulesToCategories() can still read it
   SCHEDULE_CATEGORIES.forEach(cat => { defs[scheduleSheetName(cat)] = scheduleColumns; });
 
   Object.keys(defs).forEach(name => {
@@ -1161,6 +1211,52 @@ function resetPin() {
   t.sheet.getRange(idx + 2, t.col.pin_hash + 1).setValue(hashPin(pin, salt));
 
   Logger.log(code + ' new PIN: ' + pin);
+}
+
+/**
+ * Renames a player's employee_code in place — e.g. for a promotion between
+ * categories, since the category is just the code's first letter (see
+ * categoryForEmployee()). Updates the employees row AND every matching
+ * devices row, so their existing PIN and device registration keep working
+ * completely unchanged: no new PIN, no re-registering, nothing for the
+ * player to do.
+ *
+ * Historical punch_events, punch_requests, corrections, and weekly_summary
+ * rows are deliberately left under the old code — they're a record of
+ * what was true at the time. A report spanning the rename date will show
+ * the player split across both codes (old code before, new code after),
+ * which is correct, not a bug. Going forward, the new code's first letter
+ * decides which schedule category applies — nothing else to change.
+ *
+ * Run from the editor: renameEmployeeCode('Y015', 'A021').
+ */
+function renameEmployeeCode(oldCode, newCode) {
+  const from = String(oldCode || '').trim().toUpperCase();
+  const to = String(newCode || '').trim().toUpperCase();
+  if (!from || !to) return Logger.log('Please provide both oldCode and newCode.');
+  if (from === to) return Logger.log('oldCode and newCode are the same — nothing to do.');
+
+  const emp = readTable(SHEETS.EMPLOYEES);
+  const fromIdx = emp.rows.findIndex(e => String(e.employee_code).trim().toUpperCase() === from);
+  if (fromIdx < 0) return Logger.log('Not found: ' + from);
+  if (emp.rows.some(e => String(e.employee_code).trim().toUpperCase() === to)) {
+    return Logger.log(to + ' is already in use — choose a different code.');
+  }
+
+  emp.sheet.getRange(fromIdx + 2, emp.col.employee_code + 1).setValue(to);
+
+  const dev = readTable(SHEETS.DEVICES);
+  let updatedDevices = 0;
+  dev.rows.forEach((d, i) => {
+    if (String(d.employee_code).trim().toUpperCase() === from) {
+      dev.sheet.getRange(i + 2, dev.col.employee_code + 1).setValue(to);
+      updatedDevices++;
+    }
+  });
+
+  Logger.log(from + ' renamed to ' + to + '. Updated ' + updatedDevices + ' device registration(s) — ' +
+             'their existing PIN and device registration still work, no re-registration needed. ' +
+             'Historical punch_events/corrections/requests/weekly_summary rows remain under ' + from + '.');
 }
 
 /**
@@ -1781,11 +1877,11 @@ function buildAttendanceReportData(startDate, endDate, empCodesFilter, empPrefix
       perEmployeeCol[code][d] = isNum(worked.hours) ? Number(worked.hours) : 0;
       colIncluded[d + '|' + code] = true;
     } else {
-      const buckets = splitBySession(dayEvents, starts);
+      const buckets = splitBySession(dayEvents, starts, d, distinctSessionEnds(d, categories, starts));
       buckets.forEach((bucketEvents, i) => {
         if (!bucketEvents.length) return;
         const label = d + '(' + (i + 1) + ')';
-        const sessionStart = Utilities.parseDate(d + ' ' + starts[i], CONFIG.TZ, 'yyyy-MM-dd HH:mm');
+        const sessionStart = parseDateTime(d, starts[i]);
         const schedule = findSchedule(d, code, '', sessionStart);
         // No real schedule for this employee in this session — don't credit
         // the CONFIG fallback's hours (see recomputeDayWorked()'s docs for why).
@@ -1821,7 +1917,7 @@ function buildAttendanceReportData(startDate, endDate, empCodesFilter, empPrefix
       totalActual += hrs;
 
       const sched = c.sessionStart
-        ? findSchedule(c.date, code, '', Utilities.parseDate(c.date + ' ' + c.sessionStart, CONFIG.TZ, 'yyyy-MM-dd HH:mm'))
+        ? findSchedule(c.date, code, '', parseDateTime(c.date, c.sessionStart))
         : findSchedule(c.date, code, '');
       if (sched && sched.matched) {
         scheduledCount++;
@@ -2055,40 +2151,6 @@ function sortScheduleSheetByName(sheetName) {
   t.sheet.getRange(2, 1, values.length, t.headers.length).setValues(values);
 }
 
-/**
- * One-time migration: copies every row from the old unified 'schedules'
- * sheet into ALL FOUR category sheets (schedule_A/S/N/Y), since every row
- * in that sheet was a blanket entry (blank employee_code) that applied to
- * the whole team regardless of category. Run this once, from the Apps
- * Script editor, after running setup() to create the new sheets — it makes
- * every practice already entered keep applying to everyone until it's
- * edited to diverge per category. Safe to run more than once: each
- * category sheet's existing rows are cleared first, so re-running just
- * re-copies from 'schedules' rather than duplicating.
- */
-function migrateSchedulesToCategories() {
-  const old = readTable(SHEETS.SCHEDULES_LEGACY);
-  SCHEDULE_CATEGORIES.forEach(cat => {
-    const name = scheduleSheetName(cat);
-    const sh = sheet(name);
-    if (sh.getLastRow() > 1) sh.getRange(2, 1, sh.getLastRow() - 1, sh.getLastColumn()).clearContent();
-    old.rows.forEach(r => {
-      appendRowByHeader(name, {
-        business_date: normalizeDateStr(r.business_date),
-        employee_code: r.employee_code || '',
-        practice_loc_id: r.practice_loc_id || '',
-        scheduled_start: padTimeStr(r.scheduled_start),
-        scheduled_hours: r.scheduled_hours,
-        note: r.note || ''
-      });
-    });
-    sortScheduleSheetByName(name);
-  });
-  Logger.log('Copied ' + old.rows.length + ' rows from "schedules" into each of: ' +
-             SCHEDULE_CATEGORIES.map(scheduleSheetName).join(', '));
-}
-
-
 /* ════════════════════════════════════════════
    11. Punch correction (admin, password-protected)
    ════════════════════════════════════════════ */
@@ -2201,7 +2263,7 @@ function handleEditEvent(req) {
     return { ok: false, error: 'ALREADY_VOIDED', message: 'This punch has already been voided and can’t be edited.' };
   }
 
-  const newPunchedAt = Utilities.parseDate(newDate + ' ' + newTime, CONFIG.TZ, 'yyyy-MM-dd HH:mm');
+  const newPunchedAt = parseDateTime(newDate, newTime);
   const newBusinessDate = businessDate(newPunchedAt);
 
   const oldCode = String(row[t.col.employee_code]).trim().toUpperCase();
@@ -2372,7 +2434,7 @@ function handleAddEvent(req) {
     .find(l => truthy(l.is_active) && String(l.loc_id).trim() === locId);
   if (!practiceLoc) return { ok: false, error: 'BAD_LOCATION', message: 'Please choose a valid practice location.' };
 
-  const punchedAt = Utilities.parseDate(date + ' ' + time, CONFIG.TZ, 'yyyy-MM-dd HH:mm');
+  const punchedAt = parseDateTime(date, time);
   const created = createManualPunchEvent(emp, practiceLoc, type, punchedAt, 'admin-correction-tool');
 
   appendRowByHeader(SHEETS.CORRECTIONS, {
@@ -2550,12 +2612,12 @@ function handleApproveRequest(req) {
   const hasEarlyLeave = truthy(row[t.col.has_early_leave]);
   const departureTime = row[t.col.departure_time] ? padTimeStr(row[t.col.departure_time]) : '';
 
-  const arrivalAt = Utilities.parseDate(bDate + ' ' + arrivalTime, CONFIG.TZ, 'yyyy-MM-dd HH:mm');
+  const arrivalAt = parseDateTime(bDate, arrivalTime);
   const arrivalCreated = createManualPunchEvent(emp, practiceLoc, 'IN', arrivalAt, 'player-request-approved');
 
   let departureEventId = '';
   if (hasEarlyLeave && departureTime) {
-    const departureAt = Utilities.parseDate(bDate + ' ' + departureTime, CONFIG.TZ, 'yyyy-MM-dd HH:mm');
+    const departureAt = parseDateTime(bDate, departureTime);
     const departureCreated = createManualPunchEvent(emp, practiceLoc, 'OUT', departureAt, 'player-request-approved');
     departureEventId = departureCreated.eventId;
   }
