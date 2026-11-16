@@ -142,6 +142,7 @@
         <button type="button" class="tab-btn" data-status="ALL">All</button>
       </div>
       <div id="list-msg"></div>
+      <button class="btn-ok hide" id="btn-approve-all" style="margin-bottom:12px"></button>
       <div class="req-list" id="req-list"></div>
       <div class="spacer"></div>
       <button class="btn-secondary" id="btn-refresh">Refresh</button>
@@ -174,9 +175,9 @@ function esc(s){
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
-async function api(payload){
+async function api(payload, timeoutMs){
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), CONFIG.FETCH_TIMEOUT_MS);
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs || CONFIG.FETCH_TIMEOUT_MS);
   try {
     const res = await fetch(CONFIG.API_URL, {
       method: 'POST',
@@ -197,10 +198,11 @@ const ERROR_MESSAGES = {
   NOT_FOUND: 'That request could no longer be found.',
   BAD_LOCATION: 'That practice location no longer exists — please reject and ask the player to resubmit.',
   NO_REASON: 'Please enter a reason.',
-  ALREADY_REVIEWED: 'This request has already been reviewed.'
+  ALREADY_REVIEWED: 'This request has already been reviewed.',
+  BUSY: 'Another approval is in progress — please try again in a moment.'
 };
 
-const state = { password: '', status: 'PENDING' };
+const state = { password: '', status: 'PENDING', pendingIds: [] };
 
 /* ── Your name: remembered on this device between visits ── */
 try {
@@ -264,6 +266,12 @@ async function refresh(){
 function renderList(requests){
   const list = $('req-list');
   list.innerHTML = '';
+
+  // Bulk-approve button: counts only the PENDING requests currently listed.
+  state.pendingIds = requests.filter(r => r.status === 'PENDING').map(r => r.request_id);
+  const allBtn = $('btn-approve-all');
+  allBtn.classList.toggle('hide', !state.pendingIds.length);
+  allBtn.textContent = `Approve all pending (${state.pendingIds.length})`;
   if (!requests.length){
     list.innerHTML = '<p class="note" style="margin:0">Nothing here.</p>';
     return;
@@ -420,6 +428,44 @@ function buildRejectForm(req, card, sub){
 
   return wrap;
 }
+
+/* ── Bulk approve ─────────────────────── */
+$('btn-approve-all').onclick = async () => {
+  const ids = state.pendingIds.slice();
+  if (!ids.length) return;
+  if (!confirm(`Approve all ${ids.length} pending request(s)?
+
+A Check In (and Leave Early, if requested) will be created for each one.`)) return;
+
+  const btn = $('btn-approve-all');
+  btn.disabled = true; btn.textContent = 'Approving…';
+  setMsg($('list-msg'), '');
+  let result = null, errText = '';
+  try {
+    // Many sheet writes per request, so allow far longer than a normal call.
+    const r = await api({
+      action: 'approve_all_requests',
+      password: state.password,
+      request_ids: ids,
+      reviewed_by: reviewedBy(),
+      review_note: ''
+    }, 180000);
+    if (r.ok) result = r;
+    else errText = ERROR_MESSAGES[r.error] || r.message || 'Something went wrong.';
+  } catch(e){
+    errText = 'The connection dropped — some requests may already be approved. Please Refresh to check.';
+  }
+  await refresh();           // clears list-msg, so show the outcome afterwards
+  btn.disabled = false;
+  if (errText) return setMsg($('list-msg'), errText, 'err');
+
+  if (!result.failed.length){
+    setMsg($('list-msg'), `Approved ${result.approved} request(s).`, 'ok');
+  } else {
+    const lines = result.failed.map(f => `${f.employee_name} (${f.business_date}): ${f.message}`).join(' / ');
+    setMsg($('list-msg'), `Approved ${result.approved}; ${result.failed.length} could not be approved — ${lines}`, 'warn');
+  }
+};
 
 /* ── Wiring ───────────────── */
 $('btn-unlock').onclick = unlock;

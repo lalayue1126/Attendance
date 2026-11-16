@@ -176,6 +176,7 @@ function doPost(e) {
       case 'submit_request':  return json(handleSubmitRequest(req));
       case 'list_requests':   return json(handleListRequests(req));
       case 'approve_request': return json(handleApproveRequest(req));
+      case 'approve_all_requests': return json(handleApproveAllRequests(req));
       case 'reject_request':  return json(handleRejectRequest(req));
       default:
         return json({ ok: false, error: 'BAD_ACTION', message: 'Unknown action.' });
@@ -2597,6 +2598,16 @@ function handleApproveRequest(req) {
     return { ok: false, error: 'ALREADY_REVIEWED', message: 'This request has already been reviewed.' };
   }
 
+  return approveRequestRow(t, row, idx + 2, reviewedBy, note);
+}
+
+/**
+ * Creates the punch(es) for one PENDING request row and marks it APPROVED.
+ * Shared by handleApproveRequest() (one) and handleApproveAllRequests()
+ * (bulk). `row` is that sheet row's values, `sheetRow` its 1-based row number.
+ * The caller has already checked the status is PENDING.
+ */
+function approveRequestRow(t, row, sheetRow, reviewedBy, note) {
   const code = String(row[t.col.employee_code]).trim().toUpperCase();
   const emp = findEmployee(code);
   if (!emp) return { ok: false, error: 'NOT_FOUND', message: 'That player is no longer registered.' };
@@ -2622,7 +2633,6 @@ function handleApproveRequest(req) {
     departureEventId = departureCreated.eventId;
   }
 
-  const sheetRow = idx + 2;
   t.sheet.getRange(sheetRow, t.col.status + 1).setValue('APPROVED');
   t.sheet.getRange(sheetRow, t.col.reviewed_at + 1).setValue(new Date());
   t.sheet.getRange(sheetRow, t.col.reviewed_by + 1).setValue(reviewedBy);
@@ -2631,6 +2641,64 @@ function handleApproveRequest(req) {
   t.sheet.getRange(sheetRow, t.col.departure_event_id + 1).setValue(departureEventId);
 
   return { ok: true };
+}
+
+
+/**
+ * Approves every PENDING request in one go (or only those listed in
+ * req.request_ids, which is what requests.html sends so that only the
+ * requests the admin was looking at are approved). A request that can't be
+ * approved (player removed, location deleted…) is skipped and reported in
+ * `failed` instead of aborting the rest. Holds the script lock so two bulk
+ * clicks can't approve the same request twice.
+ */
+function handleApproveAllRequests(req) {
+  if (!checkReportPassword(req.password)) {
+    return { ok: false, error: 'BAD_PASSWORD', message: 'Incorrect password.' };
+  }
+
+  const reviewedBy = String(req.reviewed_by || '').trim();
+  const note = String(req.review_note || '').trim();
+  const onlyIds = Array.isArray(req.request_ids)
+    ? req.request_ids.map(id => String(id).trim()) : null;
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) {
+    return { ok: false, error: 'BUSY', message: 'Another approval is in progress — please try again in a moment.' };
+  }
+  try {
+    const t = readHeader(SHEETS.REQUESTS);
+    const lastRow = t.sheet.getLastRow();
+    if (lastRow < 2) return { ok: true, approved: 0, failed: [] };
+    const values = t.sheet.getRange(2, 1, lastRow - 1, t.headers.length).getValues();
+
+    let approved = 0;
+    const failed = [];
+    values.forEach((row, i) => {
+      if (String(row[t.col.status]).trim().toUpperCase() !== 'PENDING') return;
+      const id = String(row[t.col.request_id]);
+      if (onlyIds && onlyIds.indexOf(id) === -1) return;
+
+      let r;
+      try {
+        r = approveRequestRow(t, row, i + 2, reviewedBy, note);
+      } catch (err) {
+        logError(err);
+        r = { ok: false, message: 'Server error.' };
+      }
+      if (r.ok) approved++;
+      else failed.push({
+        request_id: id,
+        employee_name: String(row[t.col.employee_name]),
+        business_date: normalizeDateStr(row[t.col.business_date]),
+        message: r.message || r.error || 'Failed.'
+      });
+    });
+
+    return { ok: true, approved: approved, failed: failed };
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 /** Rejects a pending request — no punch_events row is created. Requires a reason, shown back to the player if they ever check their request's status. */
